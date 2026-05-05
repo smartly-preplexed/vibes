@@ -417,19 +417,13 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   removeInactiveElements: () => {
     const now = Date.now();
     const { isPined } = usePinStore.getState();
-    
+    const { connectionLifetime, nodeLifetime } = usePhysicsStore.getState();
+
     set((state) => {
-      // Check if we're approaching critical node count
-      const isNearCritical = state.nodes.length >= MAX_NODES;
-      
-      // Use shorter expiration times when we have many nodes
-      const nodeExpirationTime = isNearCritical 
-        ? NODE_EXPIRATION_TIME * 0.6 // More aggressive cleanup when we have many nodes
-        : NODE_EXPIRATION_TIME;
-        
-      const connectionExpirationTime = isNearCritical
-        ? CONNECTION_EXPIRATION_TIME * 0.6
-        : CONNECTION_EXPIRATION_TIME;
+      // Respect the user-configured lifetimes from the physics panel.
+      // Add a small buffer so the store never prunes before the layout engine does.
+      const connectionExpirationTime = connectionLifetime + 2000;
+      const nodeExpirationTime = nodeLifetime + 2000;
       
       // Preserve newest nodes up to the user's configured display limit.
       // Using maxNodes from settings so cleanup respects the same cap as the renderer.
@@ -443,28 +437,16 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       const preservedNodes = sortedNodes.slice(0, PRESERVE_NEWEST_COUNT);
       const olderNodes = sortedNodes.slice(PRESERVE_NEWEST_COUNT);
       
-      // Filter older nodes by activity (but only if we have way too many)
-      const activeOlderNodes = state.nodes.length > 2000 ? olderNodes.filter(
+      const activeOlderNodes = olderNodes.filter(
         (node) => now - node.lastActive < nodeExpirationTime || isPined(node.id)
-      ) : olderNodes; // Keep all older nodes if we're under 2000 total
+      );
       
       // Final node list is preserved + active older nodes
       const activeNodes = [...preservedNodes, ...activeOlderNodes];
       
-      // Sort connections by activity time (most recent first)
-      const sortedConnections = [...state.connections].sort((a, b) => b.lastActive - a.lastActive);
-      
-      // Keep newest connections regardless of activity, then filter older ones
-      const preservedConnections = sortedConnections.slice(0, PRESERVE_NEWEST_COUNT * 2); // More connections than nodes
-      const olderConnections = sortedConnections.slice(PRESERVE_NEWEST_COUNT * 2);
-      
-      // Filter older connections by activity (but only if we have way too many)
-      const activeOlderConnections = state.connections.length > 3000 ? olderConnections.filter(
+      const activeConnections = state.connections.filter(
         (connection) => now - connection.lastActive < connectionExpirationTime
-      ) : olderConnections; // Keep all older connections if we're under 3000 total
-      
-      // Final connection list is preserved + active older connections
-      const activeConnections = [...preservedConnections, ...activeOlderConnections];
+      );
       
       const nodesRemoved = state.nodes.length - activeNodes.length;
       if (nodesRemoved > 0) {

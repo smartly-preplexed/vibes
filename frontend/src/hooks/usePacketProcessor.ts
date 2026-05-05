@@ -79,6 +79,10 @@ interface FlowEntry {
   packetSource?: string;
 }
 
+function getConversationKey(src: string, dst: string): string {
+  return src < dst ? `${src}↔${dst}` : `${dst}↔${src}`;
+}
+
 // Flow-window aggregation: drain packets into a per-flow map, flush to store
 // every FLUSH_INTERVAL ms. This decouples packet rate from store update rate,
 // making the frontend safe at 10G/100G where individual packet processing would
@@ -113,15 +117,18 @@ export const usePacketProcessor = () => {
       if (seq > maxSeq) maxSeq = seq;
       if (!packet.src || !packet.dst) return;
 
-      const key = `${packet.src}→${packet.dst}`;
+      const key = getConversationKey(packet.src, packet.dst);
       const existing = flowBuffer.current.get(key);
       if (existing) {
         existing.lastActive = now;
         if (packet.protocol) existing.protocol = packet.protocol;
+        if (packet.src_port) existing.srcPort = packet.src_port;
+        if (packet.dst_port) existing.dstPort = packet.dst_port;
       } else {
+        const sourceFirst = packet.src < packet.dst;
         flowBuffer.current.set(key, {
-          src: packet.src,
-          dst: packet.dst,
+          src: sourceFirst ? packet.src : packet.dst,
+          dst: sourceFirst ? packet.dst : packet.src,
           protocol: packet.protocol,
           srcPort: packet.src_port,
           dstPort: packet.dst_port,
@@ -173,7 +180,7 @@ export const usePacketProcessor = () => {
             ports: new Set(flow.dstPort ? [flow.dstPort] : []),
           } as Node,
           conn: {
-            id: `${flow.src}-${flow.dst}`,
+            id: getConversationKey(flow.src, flow.dst),
             source: flow.src,
             target: flow.dst,
             protocol: flow.protocol,

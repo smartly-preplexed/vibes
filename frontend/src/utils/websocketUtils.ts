@@ -35,7 +35,7 @@ export function getWebSocketUrl(config: WebSocketConfig = {}): string {
   
   if (!port) {
     // If we're in development mode (Vite dev server), assume backend is on 8080
-    if (currentPort === '5173' || currentPort === '3000' || process.env.NODE_ENV === 'development') {
+    if (currentPort === '5173' || currentPort === '3000' || import.meta.env.DEV) {
       port = 8080;
     } else {
       // In production, try to use the same port as the current page
@@ -75,7 +75,7 @@ export function getApiBaseUrl(config: Partial<WebSocketConfig> = {}): string {
   
   if (!port) {
     // If we're in development mode, assume backend is on 8080
-    if (currentPort === '5173' || currentPort === '3000' || process.env.NODE_ENV === 'development') {
+    if (currentPort === '5173' || currentPort === '3000' || import.meta.env.DEV) {
       port = 8080;
     } else {
       port = currentPort ? parseInt(currentPort) : undefined;
@@ -91,7 +91,7 @@ export function getApiBaseUrl(config: Partial<WebSocketConfig> = {}): string {
  * Check if we're running in development mode
  */
 export function isDevelopmentMode(): boolean {
-  return process.env.NODE_ENV === 'development' || 
+  return import.meta.env.DEV ||
          window.location.port === '5173' || 
          window.location.port === '3000';
 }

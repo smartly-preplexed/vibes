@@ -10,19 +10,36 @@ export interface SettingsState {
   setMaxConnectionsPerNode: (n: number) => void;
 }
 
+const defaultSettings = {
+  verboseLogging: false,
+  maxNodes: 75,
+  maxConnectionsPerNode: 10,
+};
+
+const SETTINGS_VERSION = 4;
+
 export const useSettingsStore = create<SettingsState>()(
   persist(
     (set) => ({
-      verboseLogging: false,
+      ...defaultSettings,
       toggleVerboseLogging: () => set((state) => ({ verboseLogging: !state.verboseLogging })),
-      maxNodes: 75,
       setMaxNodes: (n) => set({ maxNodes: n }),
-      maxConnectionsPerNode: 5,
-      setMaxConnectionsPerNode: (n) => set({ maxConnectionsPerNode: n }),
+      setMaxConnectionsPerNode: (n) => set({ maxConnectionsPerNode: Math.max(1, Math.min(150, n)) }),
     }),
     {
       name: 'display-settings-storage',
+      version: SETTINGS_VERSION,
       storage: createJSONStorage(() => localStorage),
+      migrate: (persistedState: any, version: number) => {
+        if (version < SETTINGS_VERSION) {
+          return { ...defaultSettings };
+        }
+        return {
+          ...defaultSettings,
+          ...persistedState,
+          maxConnectionsPerNode: Math.max(1, Math.min(150, persistedState?.maxConnectionsPerNode ?? 10)),
+        };
+      },
     }
   )
 );

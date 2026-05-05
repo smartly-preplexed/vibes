@@ -117,10 +117,17 @@ type SimulatedCapture struct {
 	running    bool
 }
 
+type simulatedFlow struct {
+	src      string
+	dst      string
+	protocol string
+	weight   int
+}
+
 // NewSimulatedCapture creates a new simulated capture
 func NewSimulatedCapture() *SimulatedCapture {
 	return &SimulatedCapture{
-		packetChan: make(chan *Packet, 1000), // Increased buffer for busy network simulation
+		packetChan: make(chan *Packet, 10000),
 		stopChan:   make(chan bool),
 		running:    false,
 	}
@@ -133,8 +140,104 @@ func (s *SimulatedCapture) Start() error {
 	}
 
 	s.running = true
-	go s.generatePackets()
+	go s.generateStablePackets()
 	return nil
+}
+
+// generateStablePackets creates durable conversations that rotate over time.
+// The visualizer needs coherent "who is talking right now" topology; a random
+// packet firehose creates edge noise that no force layout can make readable.
+func (s *SimulatedCapture) generateStablePackets() {
+	ticker := time.NewTicker(2 * time.Millisecond)
+	rotateTicker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	defer rotateTicker.Stop()
+
+	rand.Seed(time.Now().UnixNano())
+
+	clients := []string{
+		"192.168.1.21", "192.168.1.34", "192.168.1.45", "192.168.1.58", "192.168.1.72",
+		"192.168.1.88", "192.168.1.103", "192.168.1.121", "192.168.1.144", "192.168.1.162",
+		"192.168.2.22", "192.168.2.39", "192.168.2.57", "192.168.2.74", "192.168.2.96",
+		"192.168.2.118", "192.168.2.137", "192.168.2.153", "192.168.2.181", "192.168.2.205",
+	}
+	servers := []string{
+		"10.0.0.10", "10.0.0.11", "10.0.0.12", "10.0.0.20", "10.0.0.21", "10.0.0.30",
+	}
+	gateways := []string{"192.168.1.1", "192.168.2.1"}
+	internet := []string{
+		"1.1.1.1", "8.8.8.8", "13.107.0.1", "23.45.0.1", "35.186.0.1",
+		"52.84.0.1", "104.18.0.1", "140.82.112.1", "151.101.1.1", "172.217.1.1",
+	}
+
+	buildFlows := func() []simulatedFlow {
+		flows := make([]simulatedFlow, 0, 64)
+
+		// Atom 1: office clients talking to application servers.
+		for _, client := range clients[:10] {
+			server := servers[rand.Intn(3)]
+			flows = append(flows, simulatedFlow{src: client, dst: server, protocol: ProtocolTCP, weight: 5 + rand.Intn(5)})
+		}
+
+		// Atom 2: second subnet talking to service/db hosts.
+		for _, client := range clients[10:] {
+			server := servers[3+rand.Intn(3)]
+			protocol := ProtocolTCP
+			if rand.Intn(10) < 3 {
+				protocol = ProtocolUDP
+			}
+			flows = append(flows, simulatedFlow{src: client, dst: server, protocol: protocol, weight: 4 + rand.Intn(5)})
+		}
+
+		// Gateways create small bridge atoms instead of connecting everyone to everyone.
+		for _, gateway := range gateways {
+			for i := 0; i < 4; i++ {
+				flows = append(flows, simulatedFlow{
+					src: clients[rand.Intn(len(clients))], dst: gateway, protocol: ProtocolTCP, weight: 3 + rand.Intn(4),
+				})
+			}
+			for i := 0; i < 3; i++ {
+				flows = append(flows, simulatedFlow{
+					src: gateway, dst: internet[rand.Intn(len(internet))], protocol: ProtocolTCP, weight: 2 + rand.Intn(3),
+				})
+			}
+		}
+
+		// A few direct internet conversations for visual variety.
+		for i := 0; i < 8; i++ {
+			flows = append(flows, simulatedFlow{
+				src: clients[rand.Intn(len(clients))], dst: internet[rand.Intn(len(internet))], protocol: ProtocolTCP, weight: 2 + rand.Intn(3),
+			})
+		}
+
+		return flows
+	}
+
+	flows := buildFlows()
+	log.Println("Starting high-throughput stable network simulation with rotating active conversations")
+
+	for {
+		select {
+		case <-s.stopChan:
+			log.Println("Stopping simulated packet capture")
+			return
+		case <-rotateTicker.C:
+			flows = buildFlows()
+		case <-ticker.C:
+			for i := 0; i < 14; i++ {
+				flow := flows[rand.Intn(len(flows))]
+				if rand.Intn(10) >= flow.weight {
+					continue
+				}
+				size := 80 + rand.Intn(1420)
+				s.sendPacket(flow.src, flow.dst, size, flow.protocol)
+				if rand.Intn(10) < 6 {
+					responseSize := 64 + rand.Intn(900)
+					s.sendPacket(flow.dst, flow.src, responseSize, flow.protocol)
+				}
+			}
+		}
+	}
 }
 
 // Stop stops the simulated packet capture

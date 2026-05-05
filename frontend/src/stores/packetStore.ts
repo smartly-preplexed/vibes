@@ -26,8 +26,8 @@ export interface PacketState {
 }
 
 // Constants - REDUCED for minimal mode performance
-const MAX_PACKET_HISTORY = 1000; // REDUCED: Maximum number of packets to keep in history
-const PACKET_TRIM_THRESHOLD = 1500; // REDUCED: When to aggressively trim the packet history
+const MAX_PACKET_HISTORY = 10000;
+const PACKET_TRIM_THRESHOLD = 15000;
 
 let nextPacketSeq = 0;
 
@@ -90,7 +90,7 @@ export const usePacketStore = create<PacketState>((set, get) => ({
     if (updatedPackets.length > PACKET_TRIM_THRESHOLD) {
       // Aggressive trim - keep only recent packets
       console.warn(`Packet count (${updatedPackets.length}) exceeding threshold, aggressively pruning`);
-      updatedPackets = updatedPackets.slice(-Math.floor(MAX_PACKET_HISTORY/2));
+      updatedPackets = updatedPackets.slice(-MAX_PACKET_HISTORY);
     } else if (updatedPackets.length > MAX_PACKET_HISTORY) {
       updatedPackets = updatedPackets.slice(-MAX_PACKET_HISTORY);
     }

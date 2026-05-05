@@ -1,4 +1,5 @@
 @import url('https://fonts.googleapis.com/css2?family=VT323&display=swap');
+@import url('./styles/components.css');
 
 /* Base styles */
 * {
@@ -15,9 +16,6 @@ body {
   overflow: hidden;
 }
 
-/* Try direct import with full path */
-@import url('./styles/components.css');
-
 /* Critical UI Component Styles */
 /* Settings Panel */
 .settings-panel {
@@ -31,7 +29,7 @@ body {
   color: #00ff00;
   font-family: 'VT323', monospace;
   z-index: 1000;
-  width: 300px; /* Fixed width */
+  width: 320px;
 }
 
 .settings-panel h2 {
@@ -90,17 +88,18 @@ body {
   background: rgba(0, 0, 0, 0.7);
   border: 1px solid #00ff00;
   color: #00ff00;
-  padding: 10px 20px;
+  padding: 8px 6px;
   font-family: 'VT323', monospace;
-  font-size: 18px;
+  font-size: 17px;
   cursor: pointer;
   transition: all 0.3s ease;
   border-radius: 4px;
   flex: 1;
   text-transform: uppercase;
-  letter-spacing: 1px;
+  letter-spacing: 0;
   position: relative;
   overflow: hidden;
+  white-space: nowrap;
 }
 
 .button-group button:hover {

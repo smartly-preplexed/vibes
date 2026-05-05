@@ -60,20 +60,48 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
 
     const nodes = layoutNodes.current;
     const edges = layoutEdges.current;
+    const bridgePairBudget = new Map<string, number>();
+    const drawnEdges = edges.filter(edge => {
+      if (edge.alpha <= 0) return false;
+      if (vp.zoom < 1.2) {
+        if (edge.rank > 12) return false;
+        if (edge.isBridge) {
+          const count = bridgePairBudget.get(edge.clusterPair) ?? 0;
+          if (count >= 2) return false;
+          bridgePairBudget.set(edge.clusterPair, count + 1);
+        }
+      }
+      return true;
+    });
+
+    const edgeDegree = new Map<string, number>();
+    const connectedIds = new Set<string>();
+    edges.forEach(edge => {
+      if (edge.alpha <= 0) return;
+      connectedIds.add(edge.sourceId);
+      connectedIds.add(edge.targetId);
+    });
+    drawnEdges.forEach(edge => {
+      edgeDegree.set(edge.sourceId, (edgeDegree.get(edge.sourceId) ?? 0) + 1);
+      edgeDegree.set(edge.targetId, (edgeDegree.get(edge.targetId) ?? 0) + 1);
+    });
 
     // ── Draw edges ──────────────────────────────────────────────────────────
-    edges.forEach(edge => {
+    drawnEdges.forEach(edge => {
       const src = nodes.get(edge.sourceId);
       const tgt = nodes.get(edge.targetId);
       if (!src || !tgt || edge.alpha <= 0) return;
 
       const proto = edge.protocol?.toLowerCase() ?? '';
-      let strokeColor = `rgba(0,255,255,${edge.alpha})`;
+      const degree = Math.max(edgeDegree.get(edge.sourceId) ?? 1, edgeDegree.get(edge.targetId) ?? 1);
+      const degreeAlpha = Math.max(0.45, Math.min(1, Math.sqrt(18 / degree)));
+      const edgeAlpha = edge.alpha * degreeAlpha * (edge.isBridge ? 0.7 : 1);
+      let strokeColor = `rgba(0,255,255,${edgeAlpha})`;
       let lineWidth = 1;
-      if      (proto === 'tcp')                       { strokeColor = `rgba(0,255,0,${edge.alpha})`;   lineWidth = 2; }
-      else if (proto === 'udp')                       { strokeColor = `rgba(255,0,255,${edge.alpha})`; lineWidth = 2; }
-      else if (proto === 'icmp')                      { strokeColor = `rgba(255,255,0,${edge.alpha})`; lineWidth = 1; }
-      else if (proto === 'http' || proto === 'https') { strokeColor = `rgba(255,165,0,${edge.alpha})`; lineWidth = 2; }
+      if      (proto === 'tcp')                       { strokeColor = `rgba(0,255,0,${edgeAlpha})`;   lineWidth = edge.isBridge ? 1 : 2; }
+      else if (proto === 'udp')                       { strokeColor = `rgba(255,0,255,${edgeAlpha})`; lineWidth = edge.isBridge ? 1 : 2; }
+      else if (proto === 'icmp')                      { strokeColor = `rgba(255,255,0,${edgeAlpha})`; lineWidth = 1; }
+      else if (proto === 'http' || proto === 'https') { strokeColor = `rgba(255,165,0,${edgeAlpha})`; lineWidth = edge.isBridge ? 1 : 2; }
 
       ctx.strokeStyle = strokeColor;
       ctx.lineWidth   = lineWidth;
@@ -95,36 +123,54 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
     });
 
     // ── Draw nodes ──────────────────────────────────────────────────────────
+    const labelBoxes: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
     nodes.forEach(node => {
       if (node.alpha <= 0) return;
 
       const hr = parseInt(node.highlightColor.slice(1, 3), 16);
       const hg = parseInt(node.highlightColor.slice(3, 5), 16);
       const hb = parseInt(node.highlightColor.slice(5, 7), 16);
+      const isConnected = connectedIds.has(node.id);
+      const visualAlpha = isConnected ? node.alpha : node.alpha * 0.35;
 
       // Glow ring for active nodes
-      if (node.radius > 7) {
-        ctx.fillStyle = `rgba(${hr},${hg},${hb},${node.alpha * 0.3})`;
+      if (node.radius > 7 && isConnected) {
+        ctx.fillStyle = `rgba(${hr},${hg},${hb},${visualAlpha * 0.3})`;
         ctx.beginPath();
         ctx.arc(node.x, node.y, node.radius * 1.5, 0, Math.PI * 2);
         ctx.fill();
       }
 
       // Node body
-      ctx.globalAlpha = node.alpha;
+      ctx.globalAlpha = visualAlpha;
       ctx.fillStyle   = node.color;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
+      ctx.arc(node.x, node.y, isConnected ? node.radius : node.radius * 0.7, 0, Math.PI * 2);
       ctx.fill();
       ctx.globalAlpha = 1;
 
-      // IP label
-      if (node.id.includes('.')) {
+      // IP labels are a zoomed-in detail. Drawing every label at overview scale
+      // turns dense traffic into text noise and hides the topology.
+      if (isConnected && node.id.includes('.') && vp.zoom >= 0.95) {
         const fontSize = Math.max(11, 13 * vp.zoom);
         ctx.font      = `${fontSize}px monospace`;
         ctx.textAlign = 'center';
         const textY = node.y + node.radius + fontSize + 2;
         const tw    = ctx.measureText(node.id).width;
+        const labelBox = {
+          x1: node.x - tw / 2 - 4,
+          y1: textY - fontSize - 2,
+          x2: node.x + tw / 2 + 4,
+          y2: textY + 4,
+        };
+        const overlapsLabel = labelBoxes.some(box =>
+          labelBox.x1 < box.x2 &&
+          labelBox.x2 > box.x1 &&
+          labelBox.y1 < box.y2 &&
+          labelBox.y2 > box.y1
+        );
+        if (overlapsLabel && vp.zoom < 1.4) return;
+        labelBoxes.push(labelBox);
         ctx.fillStyle = 'rgba(0,0,0,0.75)';
         ctx.fillRect(node.x - tw / 2 - 3, textY - fontSize, tw + 6, fontSize + 2);
         ctx.fillStyle = `rgba(${hr},${hg},${hb},${node.alpha})`;

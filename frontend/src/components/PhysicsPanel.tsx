@@ -30,12 +30,15 @@ const RangeSlider: React.FC<RangeSliderProps> = ({ label, value, min, max, step,
   </div>
 );
 
+const RefreshIcon = FiRefreshCw as React.ElementType;
+
 export const PhysicsPanel: React.FC = () => {
   const {
     connectionPullStrength,
     collisionRepulsion,
     damping,
     connectionLifetime,
+    nodeLifetime,
     nodeSpacing,
     driftAwayStrength,
     centerPullStrength,
@@ -44,6 +47,7 @@ export const PhysicsPanel: React.FC = () => {
     setCollisionRepulsion,
     setDamping,
     setConnectionLifetime,
+    setNodeLifetime,
     setNodeSpacing,
     setDriftAwayStrength,
     setCenterPullStrength,
@@ -60,7 +64,7 @@ export const PhysicsPanel: React.FC = () => {
           style={{ background: 'none', border: 'none', color: '#00ff00', cursor: 'pointer' }}
           title="Reset to defaults"
         >
-          <FiRefreshCw />
+          <RefreshIcon />
         </button>
       </div>
 
@@ -73,12 +77,13 @@ export const PhysicsPanel: React.FC = () => {
           onChange={setNodeSpacing}
           displayValue={`${nodeSpacing} px`}
         />
-        <RangeSlider 
+        <RangeSlider
           label="Drift Away Strength"
-          value={driftAwayStrength * 100}
+          value={Math.round(driftAwayStrength * 1000)}
           min="0"
-          max="500"
-          onChange={(v: number) => setDriftAwayStrength(v / 100)}
+          max="2000"
+          step="10"
+          onChange={(v: number) => setDriftAwayStrength(v / 1000)}
           displayValue={driftAwayStrength.toFixed(2)}
         />
         <RangeSlider 
@@ -101,7 +106,8 @@ export const PhysicsPanel: React.FC = () => {
           label="Damping"
           value={damping * 1000}
           min="0"
-          max="100"
+          max="900"
+          step="10"
           onChange={(v: number) => setDamping(v / 1000)}
           displayValue={damping.toFixed(3)}
         />
@@ -111,8 +117,20 @@ export const PhysicsPanel: React.FC = () => {
           min="1000"
           max="60000"
           step="1000"
-          onChange={setConnectionLifetime}
+          onChange={(v) => {
+            setConnectionLifetime(v);
+            if (v > nodeLifetime) setNodeLifetime(v);
+          }}
           displayValue={`${(connectionLifetime / 1000).toFixed(0)}s`}
+        />
+        <RangeSlider
+          label="Node Lifetime"
+          value={nodeLifetime}
+          min={connectionLifetime}
+          max="120000"
+          step="1000"
+          onChange={(v) => setNodeLifetime(Math.max(v, connectionLifetime))}
+          displayValue={`${(nodeLifetime / 1000).toFixed(0)}s`}
         />
         <RangeSlider
           label="Center Pull"

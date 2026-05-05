@@ -1,5 +1,5 @@
-import create from 'zustand';
-import { persist, StateStorage } from 'zustand/middleware';
+import { create } from 'zustand';
+import { persist, PersistStorage } from 'zustand/middleware';
 import { Address4 } from 'ip-address';
 
 // Helper function to check if a value is a valid CIDR notation.
@@ -19,7 +19,7 @@ function isIPRange(value: string): boolean {
 
 // Helper function to convert an IP address to a BigInt for comparison.
 function ipToBigInt(ip: string): bigint {
-    return ip.split('.').reduce((acc, octet) => (acc << 8n) + BigInt(parseInt(octet, 10)), 0n);
+    return ip.split('.').reduce((acc, octet) => (acc << BigInt(8)) + BigInt(parseInt(octet, 10)), BigInt(0));
 }
 
 interface PinState {
@@ -30,7 +30,7 @@ interface PinState {
   isPined: (ip: string) => boolean;
 }
 
-const storage: StateStorage = {
+const storage: PersistStorage<PinState> = {
   getItem: (name) => {
     const str = localStorage.getItem(name);
     if (!str) return null;
@@ -54,7 +54,7 @@ const storage: StateStorage = {
   removeItem: (name) => localStorage.removeItem(name),
 };
 
-export const usePinStore = create<PinState>(
+export const usePinStore = create<PinState>()(
   persist(
     (set, get) => ({
       pinningRules: new Set(),

@@ -1,10 +1,13 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useNetworkStore } from '../stores/networkStore';
 import { useSettingsStore } from '../stores/settingsStore';
 import { FiWifi, FiSliders } from 'react-icons/fi';
 import { PhysicsPanel } from './PhysicsPanel';
 
 type Tab = 'network' | 'physics';
+
+const WifiIcon = FiWifi as React.ElementType;
+const SlidersIcon = FiSliders as React.ElementType;
 
 export const SettingsPanel: React.FC<{
   captureMode: 'simulated' | 'real' | 'zeek' | 'waiting';
@@ -29,8 +32,19 @@ export const SettingsPanel: React.FC<{
   onMinimize
 }) => {
   const [activeTab, setActiveTab] = useState<Tab>('network');
+  const [ifaceOpen, setIfaceOpen] = useState(false);
+  const ifaceRef = useRef<HTMLDivElement>(null);
   const { clearNetwork } = useNetworkStore();
   const { maxNodes, setMaxNodes, maxConnectionsPerNode, setMaxConnectionsPerNode } = useSettingsStore();
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ifaceRef.current && !ifaceRef.current.contains(e.target as Node)) setIfaceOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
 
   const handlePanelMouseDown = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -49,14 +63,14 @@ export const SettingsPanel: React.FC<{
           className={activeTab === 'network' ? 'active' : ''}
           onClick={() => setActiveTab('network')}
         >
-          <FiWifi style={{display: 'inline-block', marginRight: '5px', verticalAlign: 'middle'}} />
+          <WifiIcon style={{display: 'inline-block', marginRight: '5px', verticalAlign: 'middle'}} />
           Network
         </button>
         <button 
           className={activeTab === 'physics' ? 'active' : ''}
           onClick={() => setActiveTab('physics')}
         >
-          <FiSliders style={{display: 'inline-block', marginRight: '5px', verticalAlign: 'middle'}} />
+          <SlidersIcon style={{display: 'inline-block', marginRight: '5px', verticalAlign: 'middle'}} />
           Physics
         </button>
       </div>
@@ -114,34 +128,53 @@ export const SettingsPanel: React.FC<{
             {captureMode === 'real' && (
               <div className="interface-select">
                 <h3>Network Interface</h3>
-                <select
-                  value={selectedInterface}
-                  onChange={(e) => onInterfaceSelect(e.target.value)}
-                >
-                  <option value="">Select Interface</option>
-                  {interfaces.map((iface) => (
-                    <option key={iface.name} value={iface.name}>{iface.description || iface.name}</option>
-                  ))}
-                </select>
-              </div>
-            )}
-            
-            {wsPreviewUrl && (
-              <div
-                style={{
-                  marginTop: '16px',
-                  padding: '8px',
-                  fontSize: '11px',
-                  lineHeight: 1.4,
-                  wordBreak: 'break-all',
-                  background: 'rgba(0,40,0,0.25)',
-                  border: '1px solid rgba(0,255,0,0.25)',
-                  borderRadius: '4px',
-                  fontFamily: 'ui-monospace, monospace',
-                }}
-              >
-                <div style={{ opacity: 0.85, marginBottom: '4px' }}>WebSocket URL (live)</div>
-                <div style={{ color: '#9f9' }}>{wsPreviewUrl}</div>
+                <div ref={ifaceRef} style={{ position: 'relative' }}>
+                  <button
+                    onClick={() => setIfaceOpen(v => !v)}
+                    style={{
+                      width: '100%', background: 'rgba(0,0,0,0.8)', border: '1px solid #00ff00',
+                      color: '#00ff00', padding: '8px 12px', fontFamily: 'VT323, monospace',
+                      fontSize: '18px', textAlign: 'left', cursor: 'pointer',
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    }}
+                  >
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {selectedInterface
+                        ? (interfaces.find(i => i.name === selectedInterface)?.description || selectedInterface)
+                        : 'Select Interface'}
+                    </span>
+                    <span style={{ marginLeft: '8px', flexShrink: 0 }}>{ifaceOpen ? '▲' : '▼'}</span>
+                  </button>
+                  {ifaceOpen && (
+                    <div style={{
+                      position: 'absolute', top: '100%', left: 0, right: 0,
+                      background: '#000', border: '1px solid #00ff00',
+                      zIndex: 1100, maxHeight: '200px', overflowY: 'auto',
+                    }}>
+                      {interfaces.length === 0 && (
+                        <div style={{ padding: '8px 12px', color: '#666', fontFamily: 'VT323, monospace', fontSize: '16px' }}>
+                          No interfaces found
+                        </div>
+                      )}
+                      {interfaces.map(iface => (
+                        <div
+                          key={iface.name}
+                          onClick={() => { onInterfaceSelect(iface.name); setIfaceOpen(false); }}
+                          style={{
+                            padding: '8px 12px', cursor: 'pointer',
+                            color: iface.name === selectedInterface ? '#000' : '#00ff00',
+                            background: iface.name === selectedInterface ? '#00ff00' : 'transparent',
+                            fontFamily: 'VT323, monospace', fontSize: '16px',
+                          }}
+                          onMouseEnter={e => { if (iface.name !== selectedInterface) (e.currentTarget as HTMLDivElement).style.background = 'rgba(0,255,0,0.15)'; }}
+                          onMouseLeave={e => { if (iface.name !== selectedInterface) (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
+                        >
+                          {iface.description || iface.name}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
@@ -157,7 +190,7 @@ export const SettingsPanel: React.FC<{
                 onChange={(e) => setMaxNodes(Number(e.target.value))}
                 style={{ width: '100%', marginTop: '6px' }}
               />
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', opacity: 0.6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '14px', opacity: 0.85 }}>
                 <span>50</span><span>1000</span>
               </div>
             </div>
@@ -167,14 +200,14 @@ export const SettingsPanel: React.FC<{
               <input
                 type="range"
                 min="1"
-                max="20"
+                max="150"
                 step="1"
                 value={maxConnectionsPerNode}
                 onChange={(e) => setMaxConnectionsPerNode(Number(e.target.value))}
                 style={{ width: '100%', marginTop: '6px' }}
               />
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', opacity: 0.6 }}>
-                <span>1</span><span>20</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '14px', opacity: 0.85 }}>
+                <span>1</span><span>150</span>
               </div>
             </div>
 
