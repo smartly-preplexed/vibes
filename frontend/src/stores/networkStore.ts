@@ -9,15 +9,13 @@ import { logger } from '../utils/logger';
 export interface Node {
   id: string;
   label?: string;
-  x?: number;
-  y?: number;
   size?: number;
   color?: number;
   highlighted?: boolean;
-  lastActive: number; // Timestamp of last activity
+  lastActive: number;
   type?: string;
-  packetSource?: 'real' | 'simulated' | string // For identifying real vs simulated packets
-  packetColor?: string; // Color based on the packet that created this connection
+  packetSource?: 'real' | 'simulated' | string;
+  packetColor?: string;
   ports: Set<number>;
 }
 
@@ -228,16 +226,6 @@ const pruneOldestConnections = (connections: Connection[]): Connection[] => {
   return sortedConnections.slice(connections.length - targetCount);
 };
 
-// Check for collisions between two nodes
-function checkCollision(node1: Node, node2: Node, minDistance: number): boolean {
-  if (!node1 || !node2 || node1.x === undefined || node1.y === undefined || node2.x === undefined || node2.y === undefined) {
-    return false;
-  }
-  const dx = node1.x - node2.x;
-  const dy = node1.y - node2.y;
-  const distance = Math.sqrt(dx * dx + dy * dy);
-  return distance < minDistance;
-}
 
 // Create store
 export const useNetworkStore = create<NetworkState>((set, get) => ({
@@ -570,37 +558,6 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     };
   },
 
-  // Reposition overlapping nodes to prevent visual collisions
-  repositionOverlappingNodes: () => {
-    // Use the shared nodeSpacing constant from the physics store
-    const { nodeSpacing } = usePhysicsStore.getState();
-    const minDistance = nodeSpacing;
-
-    const allNodes = new Map<string, Node>();
-    get().nodes.forEach(node => {
-      allNodes.set(node.id, node);
-    });
-
-    let repositioned = 0;
-
-    allNodes.forEach(node => {
-      // Check for collisions with other nodes
-      allNodes.forEach(otherNode => {
-        if (node.id !== otherNode.id && checkCollision(node, otherNode, minDistance)) {
-          // Simple repositioning: move the current node slightly
-          const angle = Math.random() * 2 * Math.PI;
-          if (node.x !== undefined && node.y !== undefined) {
-            node.x += Math.cos(angle) * (minDistance / 2);
-            node.y += Math.sin(angle) * (minDistance / 2);
-            repositioned++;
-          }
-        }
-      });
-    });
-
-    if (repositioned > 0) {
-      set({ nodes: Array.from(allNodes.values()) });
-      logger.log(`🔧 Repositioned ${repositioned} overlapping nodes (${minDistance}px shared threshold)`);
-    }
-  }
+  // Positions now owned by useGraphLayout — this is a no-op kept for interface compatibility
+  repositionOverlappingNodes: () => {}
 }));
