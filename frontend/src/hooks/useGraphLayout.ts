@@ -22,6 +22,7 @@ export interface LayoutNode {
 }
 
 export interface LayoutEdge {
+  id: string;
   sourceId: string;
   targetId: string;
   color: string;
@@ -133,12 +134,14 @@ export function useGraphLayout(): GraphLayoutResult {
   const layoutEdges = useRef<LayoutEdge[]>([]);
   const lastTickTime = useRef<number>(0);
   const accumulator = useRef<number>(0);
+  const syncCountdown = useRef<number>(0);
   const physicsRef = useRef(usePhysicsStore.getState());
   const viewportRef = useRef({ width: 0, height: 0 });
 
   useEffect(() => {
     if (import.meta.env.DEV) {
       (window as any).__VIBES_LAYOUT = { nodes: layoutNodes, edges: layoutEdges };
+      (window as any).__VIBES_STORE = useNetworkStore;
     }
     const { width, height } = useSizeStore.getState();
     viewportRef.current = { width, height };
@@ -179,17 +182,19 @@ export function useGraphLayout(): GraphLayoutResult {
     // Live connections, heaviest first. Weight is a decayed packet/byte EWMA
     // from networkStore — priority only, never a hard visibility threshold.
     // Edges already on screen get a sticky bonus so near-equal-weight flows
-    // don't swap budget slots every tick.
-    const currentEdgeKeys = new Set(layoutEdges.current.map(e => `${e.sourceId}|${e.targetId}`));
-    const priority = (c: typeof storeConns[number]) =>
-      (c.weight ?? 1) + (currentEdgeKeys.has(`${c.source}|${c.target}`) ? 2 : 0);
+    // don't swap budget slots every sync. Priority is computed once per conn
+    // (decorate-sort) — doing it inside the comparator is a hot-loop killer at
+    // firehose connection counts.
+    const currentEdgeKeys = new Set(layoutEdges.current.map(e => e.id));
     const candidateConns = storeConns
       .filter(c =>
         storeById.has(c.source) &&
         storeById.has(c.target) &&
         now - c.lastActive <= connectionLifetime
       )
-      .sort((a, b) => priority(b) - priority(a) || b.lastActive - a.lastActive);
+      .map(c => ({ c, p: (c.weight ?? 1) + (currentEdgeKeys.has(c.id) ? 2 : 0) }))
+      .sort((a, b) => b.p - a.p || b.c.lastActive - a.c.lastActive)
+      .map(({ c }) => c);
 
     const maxTopologyEdges = Math.max(40, Math.floor(maxNodes * 2.4));
     const nodeBudget = new Map<string, number>();
@@ -236,6 +241,7 @@ export function useGraphLayout(): GraphLayoutResult {
         layoutNodes.current.has(c.target)
       )
       .map(c => ({
+        id: c.id,
         sourceId: c.source,
         targetId: c.target,
         color: c.packetColor ?? getProtocolColor(c.protocol),
@@ -452,7 +458,14 @@ export function useGraphLayout(): GraphLayoutResult {
     accumulator.current += Math.min(rawDelta, 100);
 
     while (accumulator.current >= PHYSICS_STEP) {
-      deltaSync();
+      // Membership/edge sync scans the whole connection store — ~10 Hz is
+      // imperceptible (edge alpha fades over seconds) and keeps the 30 Hz
+      // physics steps cheap at firehose connection counts.
+      syncCountdown.current -= 1;
+      if (syncCountdown.current <= 0) {
+        deltaSync();
+        syncCountdown.current = 3;
+      }
       tickLayout(PHYSICS_STEP);
       accumulator.current -= PHYSICS_STEP;
     }

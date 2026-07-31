@@ -64,18 +64,14 @@ interface NetworkState {
 const NODE_EXPIRATION_TIME = 30000; // 30 seconds of inactivity before node starts fading
 const CONNECTION_EXPIRATION_TIME = 5000; // 5 seconds of inactivity before connection removal as requested
 
-// OPTIMIZED LIMITS: Set to 500 nodes as requested for performance
-const MAX_NODES = 1000; // REDUCED: Hard cap on node count to prevent slowdown (was 1000)
-const PRUNE_TO_COUNT = 400; // REDUCED: When pruning, reduce to this number of nodes (was 750) 
-const CRITICAL_NODE_COUNT = 800; // REDUCED: Critical threshold (was 800)
+// Hard cap on node count to prevent slowdown
+const MAX_NODES = 1000;
 
-// Constants to limit memory usage - hard limits that prevent display issues
-const HARD_LIMIT_NODES = 5000; // Absolute maximum before emergency trimming
-const HARD_LIMIT_CONNECTIONS = 4500; // Absolute maximum before emergency trimming
-
-// Target for keeping newest nodes/connections when pruning
-const KEEP_NEWEST_NODES = 1500;      // When pruning, keep this many newest nodes
-const KEEP_NEWEST_CONNECTIONS = 2000; // When pruning, keep this many newest connections
+// Emergency capacity stop for connections. Normal cleanup is lifetime-based
+// (see addFlowBatch) — this only exists to bound memory if lifetimes are set
+// absurdly long. Must stay far above the lifetime-window working set (~5-25k
+// at firehose rates) or it mass-evicts visible connections and causes flashes.
+const EMERGENCY_MAX_CONNECTIONS = 30000;
 
 // Reuse positions for nodes with same IDs to prevent constant repositioning
 const nodePositionCache = new Map<string, {x: number, y: number}>();
@@ -186,53 +182,30 @@ const checkMemoryUsage = (): boolean => {
   return isHighMemory;
 };
 
-// Helper function to prune oldest nodes when approaching limits
-const pruneOldestNodes = (nodes: Node[]): Node[] => {
-  if (nodes.length <= PRUNE_TO_COUNT) return nodes;
-  
-  logger.log(`Pruning nodes from ${nodes.length} to ${PRUNE_TO_COUNT}`);
-  
+// Helper function to prune oldest nodes when approaching limits.
+// Trims to just below the cap — cutting deep (1000 -> 400) removes nodes that
+// are still on screen and causes visible flashes.
+const pruneOldestNodes = (nodes: Node[], targetCount: number = Math.floor(MAX_NODES * 0.9)): Node[] => {
+  if (nodes.length <= targetCount) return nodes;
+
+  logger.log(`Pruning nodes from ${nodes.length} to ${targetCount}`);
+
   // Sort nodes by last active time (oldest first)
   const sortedNodes = [...nodes].sort((a, b) => a.lastActive - b.lastActive);
-  
+
   // Keep only the most recently active nodes
-  return sortedNodes.slice(nodes.length - PRUNE_TO_COUNT);
+  return sortedNodes.slice(nodes.length - targetCount);
 };
 
-// Helper function for aggressive pruning during critical node counts
-const forcePruneNodes = (nodes: Node[]): Node[] => {
-  // Even more aggressive pruning
-  const targetCount = Math.min(PRUNE_TO_COUNT, Math.floor(CRITICAL_NODE_COUNT * 0.75));
-  
-  // Keep only the most important nodes - prioritize:
-  // 1. IP address nodes (containing dots)
-  // 2. Most recently active nodes
-  
-  // First identify IP nodes
-  const ipNodes = nodes.filter(node => node.label?.includes('.') || node.id.includes('.'));
-  const otherNodes = nodes.filter(node => !(node.label?.includes('.') || node.id.includes('.')));
-  
-  // Sort both arrays by activity time
-  const sortedIpNodes = [...ipNodes].sort((a, b) => b.lastActive - a.lastActive);
-  const sortedOtherNodes = [...otherNodes].sort((a, b) => b.lastActive - a.lastActive);
-  
-  // Take most recent IP nodes, then fill remaining slots with other nodes
-  const keptIpNodes = sortedIpNodes.slice(0, Math.min(sortedIpNodes.length, targetCount * 0.6));
-  const remainingSlots = targetCount - keptIpNodes.length;
-  const keptOtherNodes = sortedOtherNodes.slice(0, Math.min(sortedOtherNodes.length, remainingSlots));
-  
-  return [...keptIpNodes, ...keptOtherNodes];
-};
-
-// Helper function to prune oldest connections
-const pruneOldestConnections = (connections: Connection[]): Connection[] => {
-  const targetCount = PRUNE_TO_COUNT * 3; // INCREASED: Allow 3x more connections than nodes
-  
+// Helper function to prune oldest connections. Trims gently to just below the
+// cap — mass cliffs (e.g. 5000 -> 1200) evict connections that are still on
+// screen and show up as render flashes.
+const pruneOldestConnections = (connections: Connection[], targetCount: number): Connection[] => {
   if (connections.length <= targetCount) return connections;
-  
+
   // Sort by last active time (oldest first)
   const sortedConnections = [...connections].sort((a, b) => a.lastActive - b.lastActive);
-  
+
   // Keep only the most recently active connections
   return sortedConnections.slice(connections.length - targetCount);
 };
@@ -327,8 +300,8 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
           byteCount: connection.byteCount ?? connection.size ?? 0,
           weight: connection.weight ?? getConnectionWeight(connection.packetCount ?? 1, connection.byteCount ?? connection.size ?? 0),
         };
-        if (state.connections.length > MAX_NODES * 3) {
-          const prunedConnections = pruneOldestConnections(state.connections);
+        if (state.connections.length > EMERGENCY_MAX_CONNECTIONS) {
+          const prunedConnections = pruneOldestConnections(state.connections, Math.floor(EMERGENCY_MAX_CONNECTIONS * 0.9));
           return { ...state, connections: [...prunedConnections, nextConnection] };
         }
         return { ...state, connections: [...state.connections, nextConnection] };
@@ -391,8 +364,22 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       let nodes = Array.from(nodeById.values());
       let connections = Array.from(connById.values());
 
+      // Continuous lifetime-based expiry, run every flush (50 ms). This is the
+      // primary cleanup: it removes a handful of entries at a time, always ones
+      // the renderer has already finished fading (+2s buffer past the visual
+      // lifetime), so pruning is never visible. Capacity cliffs are what caused
+      // the render flashes — entries still on screen vanishing in bulk.
+      const now = Date.now();
+      const { connectionLifetime, nodeLifetime } = usePhysicsStore.getState();
+      const { isPined } = usePinStore.getState();
+      connections = connections.filter(c => now - c.lastActive <= connectionLifetime + 2000);
+      nodes = nodes.filter(n => now - n.lastActive <= nodeLifetime + 2000 || isPined(n.id));
+
+      // Emergency capacity stops only — gentle trims just below the cap.
       if (nodes.length > MAX_NODES) nodes = pruneOldestNodes(nodes);
-      if (connections.length > MAX_NODES * 5) connections = pruneOldestConnections(connections);
+      if (connections.length > EMERGENCY_MAX_CONNECTIONS) {
+        connections = pruneOldestConnections(connections, Math.floor(EMERGENCY_MAX_CONNECTIONS * 0.9));
+      }
 
       return { nodes, connections };
     });

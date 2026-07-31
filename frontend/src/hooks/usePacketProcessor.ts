@@ -209,8 +209,11 @@ export const usePacketProcessor = () => {
 
       if (batch.length > 0) addFlowBatch(batch);
 
+      // Emergency backstop only. Routine cleanup is lifetime-based inside
+      // addFlowBatch; cutting into the lifetime working set here mass-evicts
+      // visible connections and flashes the render.
       if (Date.now() - lastAutocleanTimeRef.current > 15000) {
-        limitNetworkSize(3000, 5000);
+        limitNetworkSize(3000, 30000);
         lastAutocleanTimeRef.current = Date.now();
       }
     }, FLUSH_INTERVAL);
