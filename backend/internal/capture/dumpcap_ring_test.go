@@ -95,24 +95,26 @@ func TestDiscoverRingFilesRestartScenario(t *testing.T) {
 }
 
 func TestDiscoverRingFilesMixedSerialNonSerial(t *testing.T) {
-	// Test mixed serial and non-serial files sort strictly by mtime.
+	// Test that mtime-primary ordering handles cycle scenario: serial order disagrees
+	// with mtime order. Old comparator was cyclic (f3<f2<f1<f3); new one is transitive
+	// and deterministically mtime-ordered. This is a regression guard.
 	dir := t.TempDir()
 	base := time.Now().Add(-time.Hour)
 
-	// serialA: serial 5, mtime 10:00
-	pA := filepath.Join(dir, "vibes_en0_00005_20260731150000.pcap")
-	os.WriteFile(pA, []byte("x"), 0644)
-	os.Chtimes(pA, base, base)
+	// f1: serial 1 (LOW), mtime base+100s (NEWEST) — post-restart file
+	pf1 := filepath.Join(dir, "vibes_en0_00001_20260731170000.pcap")
+	os.WriteFile(pf1, []byte("x"), 0644)
+	os.Chtimes(pf1, base.Add(100*time.Second), base.Add(100*time.Second))
 
-	// manualB: no serial, mtime 10:01 (between serial files)
-	pB := filepath.Join(dir, "manual.pcap")
-	os.WriteFile(pB, []byte("x"), 0644)
-	os.Chtimes(pB, base.Add(1*time.Minute), base.Add(1*time.Minute))
+	// f2: no serial, mtime base+50s (MIDDLE)
+	pf2 := filepath.Join(dir, "manual.pcap")
+	os.WriteFile(pf2, []byte("x"), 0644)
+	os.Chtimes(pf2, base.Add(50*time.Second), base.Add(50*time.Second))
 
-	// serialC: serial 10, mtime 10:02
-	pC := filepath.Join(dir, "vibes_en0_00010_20260731160000.pcap")
-	os.WriteFile(pC, []byte("x"), 0644)
-	os.Chtimes(pC, base.Add(2*time.Minute), base.Add(2*time.Minute))
+	// f3: serial 2 (HIGH), mtime base+0s (OLDEST) — pre-restart file
+	pf3 := filepath.Join(dir, "vibes_en0_00002_20260731150100.pcap")
+	os.WriteFile(pf3, []byte("x"), 0644)
+	os.Chtimes(pf3, base, base)
 
 	files, err := discoverRingFiles(dir)
 	if err != nil {
@@ -122,8 +124,10 @@ func TestDiscoverRingFilesMixedSerialNonSerial(t *testing.T) {
 		t.Fatalf("found %d files, want 3", len(files))
 	}
 
-	// Verify mtime order regardless of serial: pA (10:00), pB (10:01), pC (10:02)
-	wantPaths := []string{pA, pB, pC}
+	// Verify mtime-primary order: f3 (oldest), f2 (middle), f1 (newest).
+	// Serial order (f3 < f1 < f2) disagrees with mtime (f3 < f2 < f1),
+	// so this was cyclic under old comparator. Now deterministically mtime-ordered.
+	wantPaths := []string{pf3, pf2, pf1}
 	for i, wantPath := range wantPaths {
 		if files[i].Path != wantPath {
 			t.Errorf("position %d: path %q, want %q", i, files[i].Path, wantPath)
