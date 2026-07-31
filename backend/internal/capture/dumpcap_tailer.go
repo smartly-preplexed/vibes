@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -22,20 +23,36 @@ type DumpcapTailerStats struct {
 
 // DumpcapTailer losslessly streams packets from a directory of pcap ring
 // files written by dumpcap (or any classic-pcap writer). Files are read in
-// ring order; a file is left only after it is fully drained.
+// discoverRingFiles order; a file is left only after it is fully drained.
+//
+// DumpcapTailer is single-use: once Stop is called (or Start fails to be
+// called again after a Stop), the instance is retired for good — create a
+// fresh one via NewDumpcapTailer for the next run. This matches how callers
+// use it (a new tailer per connection/session).
 type DumpcapTailer struct {
 	dir          string
 	packetChan   chan *Packet
 	stopChan     chan struct{}
-	running      bool
 	pollInterval time.Duration
 
-	reader       *pcapRecordReader
-	currentPath  string
-	emptyDrains  int
-	packetsRead  uint64
-	packetsDropd uint64
-	currentMu    atomic.Value // string: current path for Stats
+	mu      sync.Mutex // guards running/stopped and the stopChan close
+	running bool
+	stopped bool
+
+	// The following fields are only ever touched by the single loop()
+	// goroutine, so no lock is needed for them.
+	reader      *pcapRecordReader
+	currentPath string
+	emptyDrains int
+	// visited marks files that must never be (re)selected: files that were
+	// fully drained and abandoned in favor of another file, or files that
+	// failed to open with a permanent (non-retryable) error. Keyed by path.
+	// Pruned as files disappear from the directory listing to bound memory.
+	visited map[string]bool
+
+	packetsRead    uint64
+	packetsDropped uint64
+	currentMu      atomic.Value // string: current path for Stats
 }
 
 func NewDumpcapTailer(dir string) *DumpcapTailer {
@@ -50,6 +67,11 @@ func NewDumpcapTailer(dir string) *DumpcapTailer {
 }
 
 func (t *DumpcapTailer) Start() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped {
+		return fmt.Errorf("dumpcap tailer is single-use — create a new one")
+	}
 	if t.running {
 		return fmt.Errorf("dumpcap tailer already running")
 	}
@@ -63,10 +85,16 @@ func (t *DumpcapTailer) Start() error {
 }
 
 func (t *DumpcapTailer) Stop() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped {
+		return fmt.Errorf("dumpcap tailer already stopped")
+	}
 	if !t.running {
 		return fmt.Errorf("dumpcap tailer not running")
 	}
 	t.running = false
+	t.stopped = true
 	close(t.stopChan)
 	return nil
 }
@@ -76,7 +104,7 @@ func (t *DumpcapTailer) GetPacketChannel() <-chan *Packet { return t.packetChan 
 func (t *DumpcapTailer) Stats() DumpcapTailerStats {
 	return DumpcapTailerStats{
 		PacketsRead:    atomic.LoadUint64(&t.packetsRead),
-		PacketsDropped: atomic.LoadUint64(&t.packetsDropd),
+		PacketsDropped: atomic.LoadUint64(&t.packetsDropped),
 		CurrentFile:    t.currentMu.Load().(string),
 	}
 }
@@ -105,28 +133,33 @@ func (t *DumpcapTailer) pollOnce() {
 	if err != nil || len(files) == 0 {
 		return
 	}
+	t.pruneVisited(files)
 
-	// No current file yet: start at the oldest.
+	// No current target yet: pick the first unvisited candidate.
 	if t.currentPath == "" {
-		t.openFile(files[0].Path)
+		t.selectNext(files)
+		if t.currentPath == "" {
+			return // nothing available (all visited, or all corrupt)
+		}
 	}
 
-	// Current file deleted by ring wrap → advance.
-	if t.currentPath != "" {
-		if _, err := os.Stat(t.currentPath); err != nil {
-			log.Printf("⚠️ dumpcap tailer: current file vanished (ring wrap?): %s", t.currentPath)
-			t.advance(files)
+	// The current target (whether actively open or still pending a complete
+	// header) may have vanished — e.g. a ring wrap deleted it. Check by path,
+	// not by reader state, since a pending file can vanish too.
+	if _, err := os.Stat(t.currentPath); err != nil {
+		log.Printf("⚠️ dumpcap tailer: current file vanished (ring wrap?): %s", t.currentPath)
+		t.markVisited(t.currentPath)
+		t.selectNext(files)
+		if t.currentPath == "" {
+			return
 		}
 	}
 
 	if t.reader == nil {
-		// Defect fix: a visited-but-unreadable file (e.g. bad magic / .pcapng)
-		// leaves currentPath set but reader nil. Without this, the tailer
-		// would be stuck forever since the "currentPath == ''" branch above
-		// never fires again. Advance past it whenever a later file exists.
-		if t.currentPath != "" && t.laterFileExists(files) {
-			t.advance(files)
-		}
+		// A pending target: newPcapRecordReader previously reported an
+		// incomplete header. Never treat this as corrupt — retry the same
+		// path every poll until the writer finishes the header.
+		t.openFile(t.currentPath)
 		return
 	}
 
@@ -137,9 +170,10 @@ func (t *DumpcapTailer) pollOnce() {
 		t.emptyDrains = 0
 	}
 
-	// Drained twice with a later file available → switch.
-	if t.emptyDrains >= 2 && t.laterFileExists(files) {
-		t.advance(files)
+	// Drained twice with nothing new, and another candidate exists → switch.
+	if t.emptyDrains >= 2 && t.firstUnvisited(files, t.currentPath) != "" {
+		t.markVisited(t.currentPath)
+		t.selectNext(files)
 	}
 }
 
@@ -161,7 +195,7 @@ func (t *DumpcapTailer) drain() int {
 			case t.packetChan <- p:
 				atomic.AddUint64(&t.packetsRead, 1)
 			default:
-				atomic.AddUint64(&t.packetsDropd, 1)
+				atomic.AddUint64(&t.packetsDropped, 1)
 			}
 		}
 		count++
@@ -169,39 +203,83 @@ func (t *DumpcapTailer) drain() int {
 	return count
 }
 
-func (t *DumpcapTailer) laterFileExists(files []ringFile) bool {
-	for i, f := range files {
-		if f.Path == t.currentPath {
-			return i < len(files)-1
+// firstUnvisited returns the first file (in discoverRingFiles order) that is
+// neither marked visited nor equal to exclude, or "" if none remain. Scanning
+// from the start of the sorted list every time — rather than walking forward
+// from the current file's index — ensures a file that arrives with an
+// out-of-order (older) mtime is still picked up instead of being skipped
+// forever.
+func (t *DumpcapTailer) firstUnvisited(files []ringFile, exclude string) string {
+	for _, f := range files {
+		if f.Path == exclude {
+			continue
+		}
+		if !t.visited[f.Path] {
+			return f.Path
 		}
 	}
-	// Current not in list at all (deleted): any file counts as later.
-	return len(files) > 0
+	return ""
 }
 
-// advance moves to the file after currentPath (or the oldest if current is gone).
-func (t *DumpcapTailer) advance(files []ringFile) {
-	next := ""
-	for i, f := range files {
-		if f.Path == t.currentPath && i < len(files)-1 {
-			next = files[i+1].Path
-			break
-		}
+func (t *DumpcapTailer) markVisited(path string) {
+	if t.visited == nil {
+		t.visited = make(map[string]bool)
 	}
-	if next == "" {
-		for _, f := range files {
-			if f.Path != t.currentPath {
-				next = f.Path
-				break
-			}
-		}
-	}
-	if next == "" {
+	t.visited[path] = true
+}
+
+// pruneVisited drops visited entries for files no longer present in the
+// directory listing, bounding the map's memory to the current ring size.
+func (t *DumpcapTailer) pruneVisited(files []ringFile) {
+	if len(t.visited) == 0 {
 		return
 	}
-	t.openFile(next)
+	present := make(map[string]bool, len(files))
+	for _, f := range files {
+		present[f.Path] = true
+	}
+	for p := range t.visited {
+		if !present[p] {
+			delete(t.visited, p)
+		}
+	}
 }
 
+// selectNext closes any open reader, clears currentPath/Stats, and opens the
+// first unvisited candidate. If that candidate turns out to be permanently
+// corrupt, openFile marks it visited and clears currentPath, so this loops
+// to the next candidate — cascading past a run of unreadable files within a
+// single call instead of needing one poll per skipped file. Leaves
+// currentPath == "" if nothing usable is available.
+func (t *DumpcapTailer) selectNext(files []ringFile) {
+	if t.reader != nil {
+		t.reader.Close()
+		t.reader = nil
+	}
+	t.currentPath = ""
+	t.currentMu.Store("")
+	for {
+		next := t.firstUnvisited(files, "")
+		if next == "" {
+			return
+		}
+		t.openFile(next)
+		if t.currentPath != "" {
+			return // opened successfully, or pending on an incomplete header
+		}
+		// openFile marked `next` visited (permanently corrupt) — try the next.
+	}
+}
+
+// openFile attempts to open path as the active target.
+//   - Success: reader/currentPath/Stats all point at path.
+//   - errPcapHeaderIncomplete: the writer hasn't finished the header yet.
+//     currentPath/Stats are set to path (so pollOnce retries it next poll)
+//     but it is NOT marked visited — it must never be treated as corrupt.
+//   - Any other error: permanently corrupt (or unsupported, e.g. pcapng).
+//     Marked visited so it is never selected again; currentPath/Stats are
+//     cleared rather than left pointing at a file with no open reader (never
+//     naming an already-closed/unopened file).
 func (t *DumpcapTailer) openFile(path string) {
 	if t.reader != nil {
 		t.reader.Close()
@@ -210,12 +288,15 @@ func (t *DumpcapTailer) openFile(path string) {
 	r, err := newPcapRecordReader(path)
 	if err != nil {
 		if err == errPcapHeaderIncomplete {
-			return // writer hasn't finished the header; retry next poll
+			t.currentPath = path
+			t.currentMu.Store(path)
+			t.emptyDrains = 0
+			return
 		}
 		log.Printf("⚠️ dumpcap tailer: cannot open %s: %v (pcapng? relaunch dumpcap with -P)", path, err)
-		t.currentPath = path // mark as visited so advance() skips past it
-		t.currentMu.Store(path)
-		t.emptyDrains = 2
+		t.markVisited(path)
+		t.currentPath = ""
+		t.currentMu.Store("")
 		return
 	}
 	t.reader = r
