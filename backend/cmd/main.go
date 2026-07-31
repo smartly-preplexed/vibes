@@ -8,10 +8,13 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/c-robinson/iplib"
@@ -676,12 +679,19 @@ func main() {
 		if err := dumpcapManager.Start(); err != nil {
 			log.Fatalf("❌ dumpcap launch failed: %v", err)
 		}
-		// NOTE: this process has no signal handler (no os/signal anywhere in main.go), and
-		// http.ListenAndServe below blocks forever, so this defer only runs on the log.Fatalf
-		// path above or a graceful return from main — not on SIGINT/SIGTERM/kill. dumpcapManager
-		// is still stored as a package-level global so /api/status (if/when added) and any future
-		// shutdown hook can reach it. See task-6-report.md for detail.
 		defer dumpcapManager.Stop()
+
+		// http.ListenAndServe below blocks forever with no other exit path, so without this
+		// handler SIGINT/SIGTERM (Ctrl-C, systemd stop, deploy restart) would kill the process
+		// without ever running the defer above, orphaning the supervised dumpcap child.
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			log.Printf("🛑 shutting down: stopping dumpcap manager")
+			dumpcapManager.Stop()
+			os.Exit(0)
+		}()
 	}
 
 	// Log the current configuration
@@ -709,6 +719,24 @@ func main() {
 			return
 		}
 		json.NewEncoder(w).Encode(interfaces)
+	})
+
+	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		dumpcapStatus := map[string]interface{}{
+			"mode_enabled":   *useDumpcap,
+			"launch_enabled": *launchDumpcap,
+		}
+		if dumpcapManager != nil {
+			s := dumpcapManager.Status()
+			dumpcapStatus["running"] = s.Running
+			dumpcapStatus["pid"] = s.PID
+			dumpcapStatus["restarts"] = s.Restarts
+			dumpcapStatus["last_error"] = s.LastError
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"dumpcap": dumpcapStatus,
+		})
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

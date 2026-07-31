@@ -3,6 +3,7 @@ package capture
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,11 @@ import (
 	"syscall"
 	"time"
 )
+
+// preflightCaptureTimeout bounds the real-capture preflight probe (see
+// Preflight). dumpcap is asked to autostop after 1s (-a duration:1); this is
+// a hard ceiling in case it doesn't for some reason.
+const preflightCaptureTimeout = 5 * time.Second
 
 type DumpcapManagerConfig struct {
 	Binary             string // default "dumpcap"
@@ -162,9 +168,81 @@ func preflightAdvice(goos string) string {
 	}
 }
 
-// Preflight verifies dumpcap exists and can enumerate interfaces (the same
-// permission needed to capture). Failure is actionable, never silent.
+// Preflight verifies dumpcap can actually capture on the configured
+// interface. This deliberately does NOT use `dumpcap -D` (list interfaces):
+// enumerating interfaces does not require the same permission as opening one
+// for capture (e.g. on macOS, `-D` succeeds without ChmodBPF; only actually
+// reading from /dev/bpf* requires it), so a `-D`-only probe can pass while
+// the real, supervised capture launch fails — invisibly, since Start()
+// already returned success by the time that failure surfaces. Instead this
+// runs a real, bounded capture attempt (autostop after 1 packet or 1 second,
+// output discarded) so a permission failure is caught synchronously, before
+// Start() ever returns. Failure is actionable, never silent.
+//
+// If no interface is configured, there is nothing to capture-probe against,
+// so this falls back to the enumerate-only check.
 func (m *DumpcapManager) Preflight() error {
+	if m.cfg.Iface == "" {
+		return m.preflightEnumerate()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), preflightCaptureTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, m.cfg.Binary, "-i", m.cfg.Iface, "-c", "1", "-a", "duration:1", "-w", "-")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = io.Discard
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("dumpcap preflight failed: could not start probe: %v. %s", err, preflightAdvice(runtime.GOOS))
+	}
+
+	// Wait on its own goroutine rather than a synchronous cmd.Run()/cmd.Wait():
+	// cmd.Wait() additionally blocks until stdout/stderr see EOF, which does
+	// not happen until every process holding the write end exits — including
+	// a descendant that inherited the fd (the exact "stderr capture" gotcha
+	// documented on DumpcapManager above, for the same reason). Waiting on a
+	// goroutine lets the ctx.Done() branch below return promptly at the hard
+	// ceiling even if such a descendant is still holding stdio open.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	var runErr error
+	select {
+	case runErr = <-done:
+		// Process (and everything holding its stdio open) exited on its own.
+	case <-ctx.Done():
+		// Hard ceiling hit — exec.CommandContext already signaled the direct
+		// child. Give Wait() a brief grace period to finish reaping/draining,
+		// then proceed regardless: surviving to the ceiling at all already
+		// means it got past any permission check, so there's nothing further
+		// to learn from stderr here.
+		select {
+		case <-done:
+		case <-time.After(500 * time.Millisecond):
+		}
+		return nil
+	}
+
+	detail := strings.TrimSpace(stderr.String())
+	if runErr == nil || strings.Contains(detail, "0 packets") || strings.Contains(detail, "packets captured") {
+		// Clean exit, or dumpcap got far enough to print a capture summary —
+		// either way it was reading from the interface, so permissions are OK.
+		return nil
+	}
+
+	if detail == "" {
+		detail = runErr.Error()
+	}
+	return fmt.Errorf("dumpcap preflight failed: %s. %s", detail, preflightAdvice(runtime.GOOS))
+}
+
+// preflightEnumerate is the fallback probe used only when no interface is
+// configured (so a real capture attempt isn't possible). It only confirms
+// dumpcap exists and can enumerate interfaces — weaker than the real-capture
+// probe in Preflight, see its doc comment.
+func (m *DumpcapManager) preflightEnumerate() error {
 	cmd := exec.Command(m.cfg.Binary, "-D")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

@@ -62,9 +62,50 @@ func TestManagerPreflightFailure(t *testing.T) {
 	}
 }
 
+// TestPreflightRealCaptureRejectsPermissionError exercises the actual
+// capture-probe path (Iface set, so Preflight runs the real-capture-attempt
+// branch, not the -D-only enumerate fallback). A script that mimics
+// dumpcap's real behavior when it can enumerate interfaces fine (so a -D
+// probe would have wrongly passed) but fails to actually open the device for
+// capture must make Preflight fail, quoting the permission error.
+func TestPreflightRealCaptureRejectsPermissionError(t *testing.T) {
+	bin := fakeScript(t, `if [ "$1" = "-i" ]; then echo "dumpcap: You do not have permission to capture on device" >&2; exit 1; fi; echo "1. lo"; exit 0`)
+	m := NewDumpcapManager(DumpcapManagerConfig{Binary: bin, Iface: "en0", OutputDir: t.TempDir()})
+	err := m.Preflight()
+	if err == nil {
+		t.Fatal("expected preflight error for a permission-denied capture attempt")
+	}
+	if !strings.Contains(err.Error(), "permission") {
+		t.Errorf("error should surface the permission-denied stderr, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "ChmodBPF") && !strings.Contains(err.Error(), "setcap") {
+		t.Errorf("error should include platform-specific preflight advice, got: %v", err)
+	}
+}
+
+// TestPreflightRealCapturePassesWhenStillRunningAtTimeout covers the safety
+// net for a probe that outlives the hard ceiling (dumpcap's own -a
+// duration:1 should stop it well before this, but if it doesn't, that means
+// it got past the permission check and is actively reading from the
+// interface, so it must count as a pass, not a hang or a false failure).
+func TestPreflightRealCapturePassesWhenStillRunningAtTimeout(t *testing.T) {
+	bin := fakeScript(t, `if [ "$1" = "-i" ]; then sleep 60; fi; echo "1. lo"; exit 0`)
+	m := NewDumpcapManager(DumpcapManagerConfig{Binary: bin, Iface: "en0", OutputDir: t.TempDir()})
+	start := time.Now()
+	err := m.Preflight()
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("expected preflight to pass when the probe is still running at the hard timeout, got: %v", err)
+	}
+	if elapsed < 4*time.Second {
+		t.Errorf("expected preflight to wait out the ~%s hard timeout before passing, only took %s", preflightCaptureTimeout, elapsed)
+	}
+}
+
 func TestManagerRestartsOnDeath(t *testing.T) {
-	// -D probe succeeds; the capture invocation dies immediately.
-	bin := fakeScript(t, `if [ "$1" = "-D" ]; then echo "1. lo"; exit 0; fi; echo "boom" >&2; exit 1`)
+	// The capture-preflight probe (args: -i <iface> -c 1 ...) succeeds; the
+	// real supervised launch (args: -i <iface> -P ...) dies immediately.
+	bin := fakeScript(t, `if [ "$3" = "-c" ]; then echo "1. lo"; exit 0; fi; echo "boom" >&2; exit 1`)
 	m := NewDumpcapManager(DumpcapManagerConfig{
 		Binary: bin, Iface: "lo", OutputDir: t.TempDir(),
 		RestartBackoffBase: 10 * time.Millisecond,
@@ -84,7 +125,7 @@ func TestManagerRestartsOnDeath(t *testing.T) {
 }
 
 func TestManagerStopKillsChild(t *testing.T) {
-	bin := fakeScript(t, `if [ "$1" = "-D" ]; then exit 0; fi; sleep 60`)
+	bin := fakeScript(t, `if [ "$3" = "-c" ]; then exit 0; fi; sleep 60`)
 	m := NewDumpcapManager(DumpcapManagerConfig{
 		Binary: bin, Iface: "lo", OutputDir: t.TempDir(),
 		RestartBackoffBase: 10 * time.Millisecond,
@@ -136,7 +177,7 @@ func countLaunches(t *testing.T, path string) int {
 // orphan that nothing will ever signal to stop.
 func TestManagerStopDuringBackoffDoesNotSpawnOrphan(t *testing.T) {
 	countFile := filepath.Join(t.TempDir(), "launches")
-	bin := fakeScript(t, fmt.Sprintf(`if [ "$1" = "-D" ]; then exit 0; fi; echo x >> %q; exit 1`, countFile))
+	bin := fakeScript(t, fmt.Sprintf(`if [ "$3" = "-c" ]; then exit 0; fi; echo x >> %q; exit 1`, countFile))
 	m := NewDumpcapManager(DumpcapManagerConfig{
 		Binary: bin, Iface: "lo", OutputDir: t.TempDir(),
 		RestartBackoffBase: 100 * time.Millisecond,
@@ -165,7 +206,7 @@ func TestManagerStopDuringBackoffDoesNotSpawnOrphan(t *testing.T) {
 // Finding 2: a second Stop() call must be a safe no-op, not a panic from a
 // double close(m.stopCh).
 func TestManagerDoubleStopDoesNotPanic(t *testing.T) {
-	bin := fakeScript(t, `if [ "$1" = "-D" ]; then exit 0; fi; sleep 60`)
+	bin := fakeScript(t, `if [ "$3" = "-c" ]; then exit 0; fi; sleep 60`)
 	m := NewDumpcapManager(DumpcapManagerConfig{
 		Binary: bin, Iface: "lo", OutputDir: t.TempDir(),
 		RestartBackoffBase: 10 * time.Millisecond,
@@ -186,7 +227,7 @@ func TestManagerDoubleStopDoesNotPanic(t *testing.T) {
 // Running=true against the previous, already-dead process — and LastError
 // must explain why.
 func TestManagerStatusReflectsFailedRestart(t *testing.T) {
-	bin := fakeScript(t, `if [ "$1" = "-D" ]; then exit 0; fi; exit 1`)
+	bin := fakeScript(t, `if [ "$3" = "-c" ]; then exit 0; fi; exit 1`)
 	m := NewDumpcapManager(DumpcapManagerConfig{
 		Binary: bin, Iface: "lo", OutputDir: t.TempDir(),
 		RestartBackoffBase: 50 * time.Millisecond,
@@ -216,7 +257,7 @@ func TestManagerStatusReflectsFailedRestart(t *testing.T) {
 // truncated by a race between supervise reading it and the background copy
 // goroutine still writing it.
 func TestManagerCapturesFullStderrOnRestart(t *testing.T) {
-	bin := fakeScript(t, `if [ "$1" = "-D" ]; then exit 0; fi; echo "boom with full detail attached" >&2; exit 1`)
+	bin := fakeScript(t, `if [ "$3" = "-c" ]; then exit 0; fi; echo "boom with full detail attached" >&2; exit 1`)
 	m := NewDumpcapManager(DumpcapManagerConfig{
 		Binary: bin, Iface: "lo", OutputDir: t.TempDir(),
 		RestartBackoffBase: 10 * time.Millisecond,
