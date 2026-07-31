@@ -190,12 +190,28 @@ func (m *DumpcapManager) Preflight() error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, m.cfg.Binary, "-i", m.cfg.Iface, "-c", "1", "-a", "duration:1", "-w", "-")
+	// Make the probe its own process-group leader (pgid == its own pid) so
+	// that on the timeout path below we can kill the *whole* group, not just
+	// this direct child. exec.CommandContext's default on-cancel behavior
+	// only Kill()s the direct child — a descendant that forked (e.g. a shell
+	// wrapper backgrounding a long-lived process) would survive that,
+	// reparented to init/launchd: exactly the orphaned-process failure mode
+	// the graceful-shutdown fix (main.go's SIGINT/SIGTERM handler) exists to
+	// prevent for the supervised launch. Without this, the "still running at
+	// the hard ceiling" pass branch below could leak such an orphan every
+	// time it's taken.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.Stdout = io.Discard
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("dumpcap preflight failed: could not start probe: %v. %s", err, preflightAdvice(runtime.GOOS))
+	}
+	var pgid int
+	if cmd.Process != nil {
+		// Setpgid:true above guarantees pgid == the child's own pid.
+		pgid = cmd.Process.Pid
 	}
 
 	// Wait on its own goroutine rather than a synchronous cmd.Run()/cmd.Wait():
@@ -211,13 +227,20 @@ func (m *DumpcapManager) Preflight() error {
 	var runErr error
 	select {
 	case runErr = <-done:
-		// Process (and everything holding its stdio open) exited on its own.
+		// Process (and everything holding its stdio open) exited on its own;
+		// nothing left running in its group to clean up.
 	case <-ctx.Done():
-		// Hard ceiling hit — exec.CommandContext already signaled the direct
-		// child. Give Wait() a brief grace period to finish reaping/draining,
-		// then proceed regardless: surviving to the ceiling at all already
-		// means it got past any permission check, so there's nothing further
-		// to learn from stderr here.
+		// Hard ceiling hit. Explicitly kill the whole process group — do not
+		// rely on exec.CommandContext's default kill, which only reaches the
+		// direct child (see the SysProcAttr comment above) and would leave
+		// any forked descendant as a live orphan.
+		killProcessGroup(pgid)
+		// Give the wait goroutine a brief grace period to reap the direct
+		// child now that it (and its group) have been signaled, so no
+		// zombie is left behind; proceed regardless of whether it finishes
+		// in time — surviving to the ceiling at all already means it got
+		// past any permission check, so there's nothing further to learn
+		// from stderr here.
 		select {
 		case <-done:
 		case <-time.After(500 * time.Millisecond):
@@ -236,6 +259,19 @@ func (m *DumpcapManager) Preflight() error {
 		detail = runErr.Error()
 	}
 	return fmt.Errorf("dumpcap preflight failed: %s. %s", detail, preflightAdvice(runtime.GOOS))
+}
+
+// killProcessGroup SIGKILLs an entire process group (negative pid signals
+// the group rather than a single process) — used by Preflight's timeout path
+// to guarantee no descendant of the probe process survives as an orphan. A
+// no-op if pgid is invalid or the group is already gone (ESRCH).
+func killProcessGroup(pgid int) {
+	if pgid <= 0 {
+		return
+	}
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		log.Printf("⚠️ preflight: failed to kill probe process group %d: %v", pgid, err)
+	}
 }
 
 // preflightEnumerate is the fallback probe used only when no interface is

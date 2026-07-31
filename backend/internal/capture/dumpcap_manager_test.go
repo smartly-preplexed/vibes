@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -87,9 +88,27 @@ func TestPreflightRealCaptureRejectsPermissionError(t *testing.T) {
 // net for a probe that outlives the hard ceiling (dumpcap's own -a
 // duration:1 should stop it well before this, but if it doesn't, that means
 // it got past the permission check and is actively reading from the
-// interface, so it must count as a pass, not a hang or a false failure).
+// interface, so it must count as a pass, not a hang or a false failure) AND
+// that no descendant process survives the timeout as an orphan.
+//
+// The fake script forks a real *descendant* `sleep 60` (backgrounded, pid
+// recorded to a file) distinct from the script's own direct process, which
+// also keeps running past the hard ceiling. exec.CommandContext's default
+// on-cancel behavior only Kill()s the direct child — a naive fix would pass
+// this test's err/elapsed assertions while still leaking the backgrounded
+// descendant as an orphan (reparented to init/launchd), exactly the failure
+// mode the process-group kill exists to close. The final poll loop is what
+// actually catches that: it fails unless the whole group, including the
+// descendant, was killed.
 func TestPreflightRealCapturePassesWhenStillRunningAtTimeout(t *testing.T) {
-	bin := fakeScript(t, `if [ "$1" = "-i" ]; then sleep 60; fi; echo "1. lo"; exit 0`)
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	bin := fakeScript(t, fmt.Sprintf(`if [ "$1" = "-i" ]; then
+  sleep 60 &
+  echo $! > %q
+  sleep 60
+fi
+echo "1. lo"
+exit 0`, pidFile))
 	m := NewDumpcapManager(DumpcapManagerConfig{Binary: bin, Iface: "en0", OutputDir: t.TempDir()})
 	start := time.Now()
 	err := m.Preflight()
@@ -99,6 +118,27 @@ func TestPreflightRealCapturePassesWhenStillRunningAtTimeout(t *testing.T) {
 	}
 	if elapsed < 4*time.Second {
 		t.Errorf("expected preflight to wait out the ~%s hard timeout before passing, only took %s", preflightCaptureTimeout, elapsed)
+	}
+
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("fake script did not record its descendant pid: %v", err)
+	}
+	descendantPID, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		t.Fatalf("bad descendant pid recorded in %s: %q: %v", pidFile, string(pidBytes), err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		killErr := syscall.Kill(descendantPID, 0)
+		if killErr == syscall.ESRCH {
+			return // descendant reaped along with the rest of its process group — no orphan left behind
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("descendant pid %d still alive 2s after Preflight returned — process-group kill did not reach it, orphan leaked", descendantPID)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
