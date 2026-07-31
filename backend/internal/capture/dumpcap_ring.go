@@ -31,8 +31,9 @@ func parseRingSerial(filename string) int {
 	return n
 }
 
-// discoverRingFiles lists capture files oldest-first. Serial order wins when
-// present (dumpcap serials always increase); mtime orders manual files.
+// discoverRingFiles lists capture files oldest-first by mtime; serial breaks ties
+// for same-instant rotations. Mtime-primary ordering handles dumpcap restarts
+// where serials reset to 00001, preventing new files from jumping ahead of old ones.
 func discoverRingFiles(dir string) ([]ringFile, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -59,11 +60,11 @@ func discoverRingFiles(dir string) ([]ringFile, error) {
 	}
 	sort.Slice(files, func(i, j int) bool {
 		a, b := files[i], files[j]
-		if a.Serial >= 0 && b.Serial >= 0 && a.Serial != b.Serial {
-			return a.Serial < b.Serial
-		}
 		if !a.ModTime.Equal(b.ModTime) {
 			return a.ModTime.Before(b.ModTime)
+		}
+		if a.Serial != b.Serial {
+			return a.Serial < b.Serial
 		}
 		return a.Path < b.Path
 	})
