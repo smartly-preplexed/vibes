@@ -60,19 +60,6 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
 
     const nodes = layoutNodes.current;
     const edges = layoutEdges.current;
-    const bridgePairBudget = new Map<string, number>();
-    const drawnEdges = edges.filter(edge => {
-      if (edge.alpha <= 0) return false;
-      if (vp.zoom < 1.2) {
-        if (edge.rank > 12) return false;
-        if (edge.isBridge) {
-          const count = bridgePairBudget.get(edge.clusterPair) ?? 0;
-          if (count >= 2) return false;
-          bridgePairBudget.set(edge.clusterPair, count + 1);
-        }
-      }
-      return true;
-    });
 
     const edgeDegree = new Map<string, number>();
     const connectedIds = new Set<string>();
@@ -80,28 +67,28 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       if (edge.alpha <= 0) return;
       connectedIds.add(edge.sourceId);
       connectedIds.add(edge.targetId);
-    });
-    drawnEdges.forEach(edge => {
       edgeDegree.set(edge.sourceId, (edgeDegree.get(edge.sourceId) ?? 0) + 1);
       edgeDegree.set(edge.targetId, (edgeDegree.get(edge.targetId) ?? 0) + 1);
     });
 
     // ── Draw edges ──────────────────────────────────────────────────────────
-    drawnEdges.forEach(edge => {
+    edges.forEach(edge => {
       const src = nodes.get(edge.sourceId);
       const tgt = nodes.get(edge.targetId);
       if (!src || !tgt || edge.alpha <= 0) return;
 
       const proto = edge.protocol?.toLowerCase() ?? '';
       const degree = Math.max(edgeDegree.get(edge.sourceId) ?? 1, edgeDegree.get(edge.targetId) ?? 1);
-      const degreeAlpha = Math.max(0.45, Math.min(1, Math.sqrt(18 / degree)));
-      const edgeAlpha = edge.alpha * degreeAlpha * (edge.isBridge ? 0.7 : 1);
+      const degreeAlpha = Math.max(0.5, Math.min(1, Math.sqrt(24 / degree)));
+      const weightBoost = Math.max(0.75, Math.min(1.4, Math.sqrt(edge.weight)));
+      const edgeAlpha = Math.min(1, edge.alpha * degreeAlpha * weightBoost);
+      const weightedWidth = Math.max(1, Math.min(4, 1 + Math.log1p(edge.weight)));
       let strokeColor = `rgba(0,255,255,${edgeAlpha})`;
-      let lineWidth = 1;
-      if      (proto === 'tcp')                       { strokeColor = `rgba(0,255,0,${edgeAlpha})`;   lineWidth = edge.isBridge ? 1 : 2; }
-      else if (proto === 'udp')                       { strokeColor = `rgba(255,0,255,${edgeAlpha})`; lineWidth = edge.isBridge ? 1 : 2; }
-      else if (proto === 'icmp')                      { strokeColor = `rgba(255,255,0,${edgeAlpha})`; lineWidth = 1; }
-      else if (proto === 'http' || proto === 'https') { strokeColor = `rgba(255,165,0,${edgeAlpha})`; lineWidth = edge.isBridge ? 1 : 2; }
+      let lineWidth = weightedWidth;
+      if      (proto === 'tcp')                       { strokeColor = `rgba(0,255,0,${edgeAlpha})`;   lineWidth = weightedWidth; }
+      else if (proto === 'udp')                       { strokeColor = `rgba(255,0,255,${edgeAlpha})`; lineWidth = weightedWidth; }
+      else if (proto === 'icmp')                      { strokeColor = `rgba(255,255,0,${edgeAlpha})`; lineWidth = Math.max(1, weightedWidth - 0.75); }
+      else if (proto === 'http' || proto === 'https') { strokeColor = `rgba(255,165,0,${edgeAlpha})`; lineWidth = weightedWidth; }
 
       ctx.strokeStyle = strokeColor;
       ctx.lineWidth   = lineWidth;

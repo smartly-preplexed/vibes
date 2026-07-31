@@ -77,10 +77,12 @@ interface FlowEntry {
   dstPort?: number;
   lastActive: number;
   packetSource?: string;
+  packetCount: number;
+  byteCount: number;
 }
 
 function getConversationKey(src: string, dst: string): string {
-  return src < dst ? `${src}↔${dst}` : `${dst}↔${src}`;
+  return src < dst ? `${src}<->${dst}` : `${dst}<->${src}`;
 }
 
 // Flow-window aggregation: drain packets into a per-flow map, flush to store
@@ -121,6 +123,8 @@ export const usePacketProcessor = () => {
       const existing = flowBuffer.current.get(key);
       if (existing) {
         existing.lastActive = now;
+        existing.packetCount += 1;
+        existing.byteCount += packet.size || 0;
         if (packet.protocol) existing.protocol = packet.protocol;
         if (packet.src_port) existing.srcPort = packet.src_port;
         if (packet.dst_port) existing.dstPort = packet.dst_port;
@@ -134,6 +138,8 @@ export const usePacketProcessor = () => {
           dstPort: packet.dst_port,
           lastActive: now,
           packetSource: packet.source,
+          packetCount: 1,
+          byteCount: packet.size || 0,
         });
       }
     });
@@ -184,10 +190,13 @@ export const usePacketProcessor = () => {
             source: flow.src,
             target: flow.dst,
             protocol: flow.protocol,
+            size: flow.byteCount,
             lastActive: now,
             packetColor: getPacketColor(flow.src, flow.dst, flow.protocol),
             srcPort: flow.srcPort,
             dstPort: flow.dstPort,
+            packetCount: flow.packetCount,
+            byteCount: flow.byteCount,
           },
         });
 

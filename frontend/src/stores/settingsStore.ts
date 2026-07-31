@@ -12,11 +12,11 @@ export interface SettingsState {
 
 const defaultSettings = {
   verboseLogging: false,
-  maxNodes: 75,
+  maxNodes: 150,
   maxConnectionsPerNode: 10,
 };
 
-const SETTINGS_VERSION = 4;
+const SETTINGS_VERSION = 6;
 
 export const useSettingsStore = create<SettingsState>()(
   persist(

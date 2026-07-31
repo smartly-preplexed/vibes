@@ -31,6 +31,9 @@ export interface Connection {
   packetColor?: string; // Color based on the packet that created this connection
   srcPort?: number;
   dstPort?: number;
+  packetCount?: number;
+  byteCount?: number;
+  weight?: number;
 }
 
 interface NetworkState {
@@ -76,6 +79,14 @@ const KEEP_NEWEST_CONNECTIONS = 2000; // When pruning, keep this many newest con
 
 // Reuse positions for nodes with same IDs to prevent constant repositioning
 const nodePositionCache = new Map<string, {x: number, y: number}>();
+
+const FLOW_WEIGHT_DECAY_SECONDS = 3;
+
+const getConnectionWeight = (packetCount = 1, byteCount = 0): number => {
+  const packetScore = Math.log1p(packetCount) / Math.log(16);
+  const byteScore = Math.log1p(byteCount / 512) / Math.log(16);
+  return Math.max(0.25, Math.min(10, 0.5 + packetScore + byteScore));
+};
 
 // Helper function to generate random positions within the window bounds
 const generateRandomPosition = () => {
@@ -297,17 +308,30 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   addOrUpdateConnection: throttle((connection: Connection) => {
     const existing = get().connections.find(c => c.id === connection.id);
     if (existing) {
+      const elapsed = Math.max(0, connection.lastActive - existing.lastActive) / 1000;
+      const decay = Math.exp(-elapsed / FLOW_WEIGHT_DECAY_SECONDS);
+      const packetCount = (existing.packetCount ?? 1) * decay + (connection.packetCount ?? 1);
+      const byteCount = (existing.byteCount ?? 0) * decay + (connection.byteCount ?? connection.size ?? 0);
       existing.lastActive = connection.lastActive;
       if (connection.protocol) existing.protocol = connection.protocol;
       if (connection.srcPort) existing.srcPort = connection.srcPort;
       if (connection.dstPort) existing.dstPort = connection.dstPort;
+      existing.packetCount = packetCount;
+      existing.byteCount = byteCount;
+      existing.weight = getConnectionWeight(packetCount, byteCount);
     } else {
       set((state) => {
+        const nextConnection = {
+          ...connection,
+          packetCount: connection.packetCount ?? 1,
+          byteCount: connection.byteCount ?? connection.size ?? 0,
+          weight: connection.weight ?? getConnectionWeight(connection.packetCount ?? 1, connection.byteCount ?? connection.size ?? 0),
+        };
         if (state.connections.length > MAX_NODES * 3) {
           const prunedConnections = pruneOldestConnections(state.connections);
-          return { ...state, connections: [...prunedConnections, connection] };
+          return { ...state, connections: [...prunedConnections, nextConnection] };
         }
-        return { ...state, connections: [...state.connections, connection] };
+        return { ...state, connections: [...state.connections, nextConnection] };
       });
     }
   }, 10),
@@ -340,12 +364,27 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
         const eConn = connById.get(conn.id);
         if (eConn) {
+          const elapsed = Math.max(0, conn.lastActive - eConn.lastActive) / 1000;
+          const decay = Math.exp(-elapsed / FLOW_WEIGHT_DECAY_SECONDS);
+          const packetCount = (eConn.packetCount ?? 1) * decay + (conn.packetCount ?? 1);
+          const byteCount = (eConn.byteCount ?? 0) * decay + (conn.byteCount ?? conn.size ?? 0);
           eConn.lastActive = conn.lastActive;
           if (conn.protocol) eConn.protocol = conn.protocol;
           if (conn.srcPort) eConn.srcPort = conn.srcPort;
           if (conn.dstPort) eConn.dstPort = conn.dstPort;
+          if (conn.packetColor) eConn.packetColor = conn.packetColor;
+          eConn.packetCount = packetCount;
+          eConn.byteCount = byteCount;
+          eConn.weight = getConnectionWeight(packetCount, byteCount);
         } else {
-          connById.set(conn.id, conn);
+          const packetCount = conn.packetCount ?? 1;
+          const byteCount = conn.byteCount ?? conn.size ?? 0;
+          connById.set(conn.id, {
+            ...conn,
+            packetCount,
+            byteCount,
+            weight: conn.weight ?? getConnectionWeight(packetCount, byteCount),
+          });
         }
       });
 

@@ -24,19 +24,19 @@ export interface PhysicsSettings {
 }
 
 const defaultPhysics = {
-  connectionPullStrength: 1.80, // strong pull so connected nodes cluster tight
-  collisionRepulsion: 0.08,
-  damping: 0.8,
+  connectionPullStrength: 1.45,
+  collisionRepulsion: 0.35,
+  damping: 0.35,            // strong decay so the layout settles instead of oscillating
   connectionLifetime: 5000,
   nodeLifetime: 15000,
-  nodeSpacing: 75,              // minDist = 10+10+75 = 95px — readable node separation
-  driftAwayStrength: 2.4,       // quiet nodes reach the edge before their 15s fade expires
-  centerPullStrength: 0.0030,   // keeps active topology clustered in the center
-  springRestLength: 55,         // short lines — connected nodes sit close together
+  nodeSpacing: 75,
+  driftAwayStrength: 2.4,
+  centerPullStrength: 0.008, // anchor gravity toward each node's subnet home
+  springRestLength: 70,
 }
 
 // Increment to force-reset localStorage when defaults change
-const PHYSICS_VERSION = 18;
+const PHYSICS_VERSION = 20;
 
 export const usePhysicsStore = create<PhysicsSettings>()(
   persist(
