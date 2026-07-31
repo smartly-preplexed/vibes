@@ -8,9 +8,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +35,9 @@ var (
 	useDumpcap  = flag.Bool("dumpcap", false, "use external dumpcap for high-performance capture (requires dumpcap to be running)")
 	dumpcapDir  = flag.String("dumpcap-dir", "/data/pcaps", "directory where dumpcap writes PCAP files")
 	launchDumpcap = flag.Bool("launch-dumpcap", false, "automatically launch dumpcap process if not running")
+	dumpcapFileSizeMB = flag.Int("dumpcap-filesize-mb", 500, "dumpcap ring: size per file in MB")
+	dumpcapRingFiles  = flag.Int("dumpcap-ring-files", 20, "dumpcap ring: number of files before overwrite")
+	dumpcapBufferMB   = flag.Int("dumpcap-buffer-mb", 1024, "dumpcap kernel buffer size in MB (-B)")
 	zeekTCPListen = flag.String("zeek-tcp", "", "default listen address for Zeek conn.log JSON over TCP (e.g. :4777); used when WebSocket connects with zeek_tcp=1")
 	upgrader    = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
@@ -46,6 +46,9 @@ var (
 	}
 	// Packets dropped when WebSocket send buffer is full (ingest faster than browser/network).
 	wsSendDropped atomic.Uint64
+	// dumpcapManager is the global launched-and-supervised dumpcap process, set in main()
+	// when -dumpcap -launch-dumpcap are both given. nil otherwise (e.g. externally-run dumpcap).
+	dumpcapManager *capture.DumpcapManager
 )
 
 type Client struct {
@@ -212,23 +215,8 @@ func (manager *ClientManager) HandleWebSocket(w http.ResponseWriter, r *http.Req
 		captureSystem = capture.NewZeekConnJSONCapture(zeekAddr)
 		captureMode = "zeek_conn"
 	} else if *useDumpcap {
-		// Check dumpcap status and optionally launch it
-		if err := handleDumpcapSetup(selectedInterface, *dumpcapDir); err != nil {
-			log.Printf("❌ Dumpcap setup failed: %v", err)
-			// Fall back to real capture if available
-			if selectedInterface != "" {
-				log.Printf("⚠️ Falling back to real capture mode")
-				captureSystem = capture.NewRealCapture(selectedInterface)
-				captureMode = "real"
-			} else {
-				log.Printf("⚠️ Falling back to simulation mode")
-				captureSystem = capture.NewSimulatedCapture()
-				captureMode = "simulated"
-			}
-		} else {
-			captureSystem = capture.NewDumpcapCapture(*dumpcapDir, selectedInterface)
-			captureMode = "dumpcap"
-		}
+		captureSystem = capture.NewDumpcapTailer(*dumpcapDir)
+		captureMode = "dumpcap"
 	} else if selectedInterface != "" {
 		captureSystem = capture.NewRealCapture(selectedInterface)
 		captureMode = "real"
@@ -242,11 +230,17 @@ func (manager *ClientManager) HandleWebSocket(w http.ResponseWriter, r *http.Req
 	captureErrorMsg := ""
 	originalMode := captureMode
 	
-	if err := captureSystem.Start(); err != nil {
+	if err := captureSystem.Start(); err != nil && captureMode == "dumpcap" {
+		// dumpcap mode must never silently fall back to simulated data: the operator
+		// asked for real packets, and a silent switch to sim would hide a broken capture.
+		log.Printf("❌ dumpcap capture start failed: %v", err)
+		http.Error(w, fmt.Sprintf("dumpcap capture failed: %v", err), http.StatusInternalServerError)
+		return
+	} else if err != nil {
 		log.Printf("Failed to start %s capture: %v", captureMode, err)
 		captureFailed = true
 		captureErrorMsg = err.Error()
-		
+
 		// Fall back to simulation
 		log.Printf("Falling back to simulated capture")
 		captureSystem = capture.NewSimulatedCapture()
@@ -624,123 +618,6 @@ func (manager *ClientManager) handleSeekToTime(msg map[string]interface{}, clien
 	log.Printf("🎯 Seek complete!")
 }
 
-// checkDumpcapRunning checks if dumpcap is already running
-func checkDumpcapRunning() bool {
-	cmd := exec.Command("pgrep", "-f", "dumpcap")
-	err := cmd.Run()
-	return err == nil
-}
-
-// checkDumpcapInstalled checks if dumpcap is installed and available
-func checkDumpcapInstalled() bool {
-	cmd := exec.Command("which", "dumpcap")
-	err := cmd.Run()
-	return err == nil
-}
-
-// launchDumpcapProcess starts dumpcap with the specified interface and output directory
-func launchDumpcapProcess(iface string, outputDir string) error {
-	if !checkDumpcapInstalled() {
-		return fmt.Errorf("dumpcap not found in PATH - please install Wireshark/dumpcap")
-	}
-
-	// Create output directory if it doesn't exist
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create dumpcap output directory: %v", err)
-	}
-
-	// Generate output filename with timestamp
-	timestamp := time.Now().Format("2006-01-02_15-04-05")
-	outputFile := filepath.Join(outputDir, fmt.Sprintf("dumpcap_%s_%s.pcap", iface, timestamp))
-
-	// Build dumpcap command
-	args := []string{
-		"-i", iface,
-		"-w", outputFile,
-		"-b", "duration:3600", // Rotate every hour
-		"-b", "filesize:1000000", // Rotate at 1GB
-	}
-
-	log.Printf("🚀 Launching dumpcap: dumpcap %s", strings.Join(args, " "))
-	
-	cmd := exec.Command("dumpcap", args...)
-	
-	// Start dumpcap in background
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start dumpcap: %v", err)
-	}
-
-	log.Printf("✅ Dumpcap process started with PID %d", cmd.Process.Pid)
-	log.Printf("📁 Writing to: %s", outputFile)
-	
-	// Give dumpcap a moment to start writing
-	time.Sleep(2 * time.Second)
-	
-	return nil
-}
-
-// handleDumpcapSetup checks dumpcap status and optionally launches it
-func handleDumpcapSetup(iface string, outputDir string) error {
-	log.Printf("🔍 Checking dumpcap status...")
-	
-	// Check if dumpcap is installed
-	if !checkDumpcapInstalled() {
-		return fmt.Errorf("dumpcap not installed - please install Wireshark or dumpcap")
-	}
-	log.Printf("✅ Dumpcap is installed")
-	
-	// Check if dumpcap is already running
-	if checkDumpcapRunning() {
-		log.Printf("✅ Dumpcap process is already running")
-		
-		// Check if output directory has recent PCAP files
-		if hasRecentPcapFiles(outputDir) {
-			log.Printf("✅ Found recent PCAP files in %s", outputDir)
-			return nil
-		} else {
-			log.Printf("⚠️ Dumpcap is running but no recent PCAP files found")
-			log.Printf("💡 Check that dumpcap is writing to: %s", outputDir)
-		}
-	} else {
-		log.Printf("❌ Dumpcap is not running")
-		
-		if *launchDumpcap {
-			log.Printf("🚀 Auto-launching dumpcap...")
-			if err := launchDumpcapProcess(iface, outputDir); err != nil {
-				return fmt.Errorf("failed to auto-launch dumpcap: %v", err)
-			}
-		} else {
-			return fmt.Errorf("dumpcap is not running. Options:\n" +
-				"  1. Start dumpcap manually: dumpcap -i %s -w %s/capture.pcap\n" +
-				"  2. Use auto-launch: add -launch-dumpcap flag", iface, outputDir)
-		}
-	}
-	
-	return nil
-}
-
-// hasRecentPcapFiles checks if there are PCAP files modified in the last 5 minutes
-func hasRecentPcapFiles(dir string) bool {
-	files, err := filepath.Glob(filepath.Join(dir, "*.pcap"))
-	if err != nil {
-		return false
-	}
-	
-	cutoff := time.Now().Add(-5 * time.Minute)
-	for _, file := range files {
-		info, err := os.Stat(file)
-		if err != nil {
-			continue
-		}
-		
-		if info.ModTime().After(cutoff) {
-			return true
-		}
-	}
-	
-	return false
-}
-
 func main() {
 	flag.Parse()
 
@@ -783,7 +660,30 @@ func main() {
 			log.Printf("⚠️ Zeek TCP listen (optional startup): %v — listener will start when a WebSocket connects in Zeek mode", err)
 		}
 	}
-	
+
+	// If asked to launch+supervise dumpcap ourselves, start it now (once, for the process
+	// lifetime) rather than per-WebSocket-connection. A launch failure here is fatal and loud:
+	// the operator asked for real packets and Preflight already tells them exactly what's wrong
+	// (e.g. missing ChmodBPF), so there is nothing useful to fall back to.
+	if *useDumpcap && *launchDumpcap {
+		dumpcapManager = capture.NewDumpcapManager(capture.DumpcapManagerConfig{
+			Iface:      *iface,
+			OutputDir:  *dumpcapDir,
+			FileSizeMB: *dumpcapFileSizeMB,
+			RingFiles:  *dumpcapRingFiles,
+			BufferMB:   *dumpcapBufferMB,
+		})
+		if err := dumpcapManager.Start(); err != nil {
+			log.Fatalf("❌ dumpcap launch failed: %v", err)
+		}
+		// NOTE: this process has no signal handler (no os/signal anywhere in main.go), and
+		// http.ListenAndServe below blocks forever, so this defer only runs on the log.Fatalf
+		// path above or a graceful return from main — not on SIGINT/SIGTERM/kill. dumpcapManager
+		// is still stored as a package-level global so /api/status (if/when added) and any future
+		// shutdown hook can reach it. See task-6-report.md for detail.
+		defer dumpcapManager.Stop()
+	}
+
 	// Log the current configuration
 	if *pcapFile != "" {
 		log.Printf("📼 PCAP Replay Mode: %s (speed: %.2fx)", *pcapFile, *replaySpeed)
