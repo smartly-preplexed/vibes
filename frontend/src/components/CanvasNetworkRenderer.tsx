@@ -110,6 +110,8 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
     });
 
     // ── Draw nodes ──────────────────────────────────────────────────────────
+    // Dense populations drown in text — require more zoom before labeling.
+    const labelZoomThreshold = nodes.size > 500 ? 1.6 : nodes.size > 250 ? 1.25 : 0.95;
     const labelBoxes: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
     nodes.forEach(node => {
       if (node.alpha <= 0) return;
@@ -138,7 +140,7 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
 
       // IP labels are a zoomed-in detail. Drawing every label at overview scale
       // turns dense traffic into text noise and hides the topology.
-      if (isConnected && node.id.includes('.') && vp.zoom >= 0.95) {
+      if (isConnected && node.id.includes('.') && vp.zoom >= labelZoomThreshold) {
         const fontSize = Math.max(11, 13 * vp.zoom);
         ctx.font      = `${fontSize}px monospace`;
         ctx.textAlign = 'center';

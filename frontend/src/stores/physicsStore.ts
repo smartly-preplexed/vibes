@@ -31,12 +31,12 @@ const defaultPhysics = {
   nodeLifetime: 15000,
   nodeSpacing: 75,
   driftAwayStrength: 2.4,
-  centerPullStrength: 0.008, // anchor gravity toward each node's subnet home
+  centerPullStrength: 0.002, // weak territorial bias toward each node's subnet home
   springRestLength: 70,
 }
 
 // Increment to force-reset localStorage when defaults change
-const PHYSICS_VERSION = 20;
+const PHYSICS_VERSION = 21;
 
 export const usePhysicsStore = create<PhysicsSettings>()(
   persist(

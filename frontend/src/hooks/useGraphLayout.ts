@@ -13,6 +13,7 @@ export interface LayoutNode {
   vy: number;
   homeX: number;
   homeY: number;
+  clusterKey: string;
   radius: number;
   effectiveRadius: number;
   color: string;
@@ -43,6 +44,7 @@ const PHYSICS_HZ = 30;
 const PHYSICS_STEP = 1000 / PHYSICS_HZ;
 const NODE_RADIUS = 10;
 const QUIET_EDGE_PADDING = 120;
+const DRIFT_GRACE_MS = 1500;
 const CLUSTER_RADIUS = 110;
 
 function getProtocolColor(protocol?: string): string {
@@ -135,6 +137,11 @@ export function useGraphLayout(): GraphLayoutResult {
   const lastTickTime = useRef<number>(0);
   const accumulator = useRef<number>(0);
   const syncCountdown = useRef<number>(0);
+  // Blob slot registry: each cluster claims a stable spiral slot on first
+  // appearance, so blob placement is deterministic and never churns.
+  const clusterSlots = useRef<Map<string, { index: number; lastSeen: number }>>(new Map());
+  const nextSlot = useRef<number>(0);
+  const clusterTargets = useRef<Map<string, { x: number; y: number }>>(new Map());
   const physicsRef = useRef(usePhysicsStore.getState());
   const viewportRef = useRef({ width: 0, height: 0 });
 
@@ -142,6 +149,7 @@ export function useGraphLayout(): GraphLayoutResult {
     if (import.meta.env.DEV) {
       (window as any).__VIBES_LAYOUT = { nodes: layoutNodes, edges: layoutEdges };
       (window as any).__VIBES_STORE = useNetworkStore;
+      (window as any).__VIBES_SETTINGS = useSettingsStore;
     }
     const { width, height } = useSizeStore.getState();
     viewportRef.current = { width, height };
@@ -209,29 +217,43 @@ export function useGraphLayout(): GraphLayoutResult {
       visibleConns.push(c);
     }
 
-    // Admit new nodes in edge-weight order while there is room. Spawn at the
-    // node's deterministic home anchor so a returning IP reappears where it was.
+    // Admit new nodes in edge-weight order while there is room. A new node
+    // joins its subnet blob wherever that blob currently lives (agar.io cells
+    // join their own mass) — spawning at the static hash home instead would
+    // permanently drag blob centroids toward the hash location. The hash home
+    // only seeds the first member of a brand-new cluster.
+    const clusterSeed = new Map<string, LayoutNode>();
+    layoutNodes.current.forEach(n => {
+      if (!clusterSeed.has(n.clusterKey)) clusterSeed.set(n.clusterKey, n);
+    });
     for (const c of visibleConns) {
       for (const id of [c.source, c.target]) {
         if (layoutNodes.current.has(id)) continue;
         if (layoutNodes.current.size >= maxNodes) break;
         const sn = storeById.get(id)!;
+        const clusterKey = getClusterKey(id);
+        const sibling = clusterSeed.get(clusterKey);
         const home = getHomeAnchor(id, width, height);
-        layoutNodes.current.set(id, {
+        const spawnX = sibling ? sibling.x + (Math.random() - 0.5) * 90 : home.x + (Math.random() - 0.5) * 30;
+        const spawnY = sibling ? sibling.y + (Math.random() - 0.5) * 90 : home.y + (Math.random() - 0.5) * 30;
+        const newNode: LayoutNode = {
           id,
-          x: home.x + (Math.random() - 0.5) * 30,
-          y: home.y + (Math.random() - 0.5) * 30,
+          x: spawnX,
+          y: spawnY,
           vx: 0,
           vy: 0,
           homeX: home.x,
           homeY: home.y,
+          clusterKey,
           radius: NODE_RADIUS,
           effectiveRadius: NODE_RADIUS,
           color: getProtocolColor(c.protocol),
           highlightColor: getHighlightColor(id),
           alpha: 1,
           lastActive: sn.lastActive,
-        });
+        };
+        layoutNodes.current.set(id, newNode);
+        if (!clusterSeed.has(clusterKey)) clusterSeed.set(clusterKey, newNode);
       }
     }
 
@@ -283,6 +305,117 @@ export function useGraphLayout(): GraphLayoutResult {
       }
     });
 
+    // Density-adaptive spacing: at 150 nodes you get roomy ~50px gaps, at 1000
+    // nodes gaps shrink so the population can tile the screen instead of
+    // grinding against a fixed 75px footprint it can never satisfy.
+    const width = vp.width || 1280;
+    const height = vp.height || 800;
+    const population = Math.max(1, layoutNodes.current.size);
+    const adaptiveSpacing = Math.min(
+      nodeSpacing,
+      Math.max(12, Math.sqrt((width * height * 0.7) / population) - NODE_RADIUS * 2)
+    );
+    const minPairDist = NODE_RADIUS * 2 + adaptiveSpacing;
+
+    // ── Subnet blobs (tethered agar.io) ──────────────────────────────────────
+    // Each connected node coheres to its subnet's live centroid; blob centroids
+    // repel each other. Edge springs alone cannot separate groups when most
+    // traffic is cross-subnet — every node would get tethered into one ball.
+    const clusterAgg = new Map<string, { sx: number; sy: number; n: number }>();
+    layoutNodes.current.forEach(node => {
+      if (!connectedIds.has(node.id)) return;
+      const agg = clusterAgg.get(node.clusterKey);
+      if (agg) { agg.sx += node.x; agg.sy += node.y; agg.n += 1; }
+      else clusterAgg.set(node.clusterKey, { sx: node.x, sy: node.y, n: 1 });
+    });
+
+    // Blob radii scaled so the demanded areas actually fit the screen.
+    // Unscaled radii make blob-separation demands unsatisfiable — the system
+    // then jams the whole mass against the walls under permanent pressure.
+    let demandedArea = 0;
+    const rawRadius = new Map<string, number>();
+    clusterAgg.forEach((a, key) => {
+      const r = minPairDist * Math.sqrt(a.n / Math.PI) + minPairDist * 0.5;
+      rawRadius.set(key, r);
+      demandedArea += Math.PI * r * r;
+    });
+    const usableArea = (width - 80) * (height - 80);
+    const fit = Math.min(1, Math.sqrt((usableArea * 0.55) / Math.max(1, demandedArea)));
+
+    // ── Deterministic blob placement ─────────────────────────────────────────
+    // Blob positions are computed targets, never force outcomes. Force-based
+    // blob separation has no stable equilibrium when demanded areas exceed the
+    // screen — it jams into walls, orbits, or runs away. Targets can't.
+    clusterAgg.forEach((_, key) => {
+      const slot = clusterSlots.current.get(key);
+      if (slot) slot.lastSeen = now;
+      else clusterSlots.current.set(key, { index: nextSlot.current++, lastSeen: now });
+    });
+    for (const [key, slot] of clusterSlots.current) {
+      if (now - slot.lastSeen > 30000) {
+        clusterSlots.current.delete(key);
+        clusterTargets.current.delete(key);
+      }
+    }
+
+    const order = Array.from(clusterAgg.keys())
+      .sort((a, b) => clusterSlots.current.get(a)!.index - clusterSlots.current.get(b)!.index);
+    const placed: Array<{ x: number; y: number; r: number }> = [];
+    const clusters = new Map<string, { cx: number; cy: number; n: number; radius: number }>();
+    for (const key of order) {
+      const r = rawRadius.get(key)! * fit;
+      const slotIndex = clusterSlots.current.get(key)!.index;
+      let tx = centerX;
+      let ty = centerY;
+      if (placed.length > 0) {
+        // Golden-angle spiral: walk outward along this slot's fixed angle
+        // until the blob clears everything already placed.
+        const angle = slotIndex * 2.399963;
+        const ca = Math.cos(angle);
+        const sa = Math.sin(angle);
+        for (let d = 0; d < 2200; d += 14) {
+          tx = centerX + ca * d;
+          ty = centerY + sa * d;
+          if (placed.every(p => {
+            const ddx = tx - p.x;
+            const ddy = ty - p.y;
+            return Math.sqrt(ddx * ddx + ddy * ddy) >= (p.r + r) * 0.92 + adaptiveSpacing;
+          })) break;
+        }
+      }
+      // Keep the blob circle on screen.
+      tx = Math.max(40 + r * 0.7, Math.min(width - 40 - r * 0.7, tx));
+      ty = Math.max(40 + r * 0.7, Math.min(height - 40 - r * 0.7, ty));
+      placed.push({ x: tx, y: ty, r });
+
+      // Smooth target motion so radius breathing never teleports blobs.
+      const t = clusterTargets.current.get(key) ?? { x: tx, y: ty };
+      t.x += (tx - t.x) * 0.03 * dtNorm;
+      t.y += (ty - t.y) * 0.03 * dtNorm;
+      clusterTargets.current.set(key, t);
+      clusters.set(key, { cx: t.x, cy: t.y, n: clusterAgg.get(key)!.n, radius: r });
+    }
+
+    layoutNodes.current.forEach(node => {
+      if (isPined(node.id) || !connectedIds.has(node.id)) return;
+      const c = clusters.get(node.clusterKey);
+      if (!c) return;
+      // Membrane around the blob's TARGET circle: free inside, pulled back
+      // when outside. Repulsion sets the internal density; the gentle inner
+      // pull (centerPullStrength slider) keeps stragglers drifting home.
+      const dcx = c.cx - node.x;
+      const dcy = c.cy - node.y;
+      const dc = Math.sqrt(dcx * dcx + dcy * dcy) || 1;
+      if (dc > c.radius) {
+        const over = (dc - c.radius) / dc;
+        node.vx += dcx * over * 0.035 * dtNorm;
+        node.vy += dcy * over * 0.035 * dtNorm;
+      }
+      const inner = Math.max(centerPullStrength, 0.002);
+      node.vx += dcx * inner * dtNorm;
+      node.vy += dcy * inner * dtNorm;
+    });
+
     const pinnedList = Array.from(layoutNodes.current.values())
       .filter(n => isPined(n.id))
       .sort((a, b) => a.id.localeCompare(b.id));
@@ -318,14 +451,21 @@ export function useGraphLayout(): GraphLayoutResult {
         const fadeWindow = Math.max(1, nodeLifetime - connectionLifetime);
         node.alpha = Math.max(0, 1 - fadeAge / fadeWindow);
 
-        const dx = node.x - centerX;
-        const dy = node.y - centerY;
-        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-        const targetDist = Math.max(vp.width || 1280, vp.height || 800) * 0.5 + QUIET_EDGE_PADDING;
-        const remaining = Math.max(250, nodeLifetime - age);
-        const desiredStep = Math.max(0.8, (targetDist - dist) / (remaining / PHYSICS_STEP));
-        node.vx += (dx / dist) * driftAwayStrength * desiredStep * 0.12 * dtNorm;
-        node.vy += (dy / dist) * driftAwayStrength * desiredStep * 0.12 * dtNorm;
+        // Drift-away applies only to genuinely dead nodes. Nodes that are
+        // traffic-fresh but merely lack a displayed edge (budget rotation)
+        // must NOT get outward kicks — with the mass slightly off-center,
+        // those kicks all point the same way and the whole layout runs away
+        // into a wall.
+        if (age > connectionLifetime + DRIFT_GRACE_MS) {
+          const dx = node.x - centerX;
+          const dy = node.y - centerY;
+          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+          const targetDist = Math.max(vp.width || 1280, vp.height || 800) * 0.5 + QUIET_EDGE_PADDING;
+          const remaining = Math.max(250, nodeLifetime - age);
+          const desiredStep = Math.max(0.8, (targetDist - dist) / (remaining / PHYSICS_STEP));
+          node.vx += (dx / dist) * driftAwayStrength * desiredStep * 0.12 * dtNorm;
+          node.vy += (dy / dist) * driftAwayStrength * desiredStep * 0.12 * dtNorm;
+        }
       }
     });
 
@@ -334,57 +474,88 @@ export function useGraphLayout(): GraphLayoutResult {
       useNetworkStore.getState().removeNode(id);
     });
 
+    // Spatial-hash repulsion: O(n * neighbors) instead of O(n^2) so 1000 nodes
+    // stays real-time. Cell size = the largest interaction distance.
     const nodes = Array.from(layoutNodes.current.values());
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const a = nodes[i];
-        const b = nodes[j];
-        if (isPined(a.id) && isPined(b.id)) continue;
+    const maxSoft = (NODE_RADIUS * 2 + adaptiveSpacing) * 1.6;
+    const cellSize = Math.max(24, maxSoft);
+    const grid = new Map<number, LayoutNode[]>();
+    const cellOf = (x: number, y: number) => (Math.floor(x / cellSize) * 73856093) ^ (Math.floor(y / cellSize) * 19349663);
+    nodes.forEach(node => {
+      const key = cellOf(node.x, node.y);
+      const bucket = grid.get(key);
+      if (bucket) bucket.push(node); else grid.set(key, [node]);
+    });
 
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const minDist = a.effectiveRadius + b.effectiveRadius + nodeSpacing;
-        const softDist = minDist * 1.6;
-        if (Math.abs(dx) > softDist || Math.abs(dy) > softDist) continue;
+    const applyPair = (a: LayoutNode, b: LayoutNode) => {
+      if (isPined(a.id) && isPined(b.id)) return;
 
-        const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
-        if (dist >= softDist) continue;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      // Quiet nodes keep half the footprint — dying conversations yield space
+      // to active ones instead of holding territory while they fade.
+      const aQuiet = !connectedIds.has(a.id);
+      const bQuiet = !connectedIds.has(b.id);
+      const spacing = (aQuiet || bQuiet) ? adaptiveSpacing * 0.5 : adaptiveSpacing;
+      const minDist = a.effectiveRadius + b.effectiveRadius + spacing;
+      const softDist = minDist * 1.6;
+      if (Math.abs(dx) > softDist || Math.abs(dy) > softDist) return;
 
-        const strength = dist < minDist
-          ? collisionRepulsion * 0.65 * (minDist - dist) / dist
-          : collisionRepulsion * 0.08 * (softDist - dist) / dist;
-        const push = strength * dtNorm;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
+      if (dist >= softDist) return;
 
-        if (!isPined(a.id)) {
-          a.vx -= dx * push;
-          a.vy -= dy * push;
+      const strength = dist < minDist
+        ? collisionRepulsion * 0.65 * (minDist - dist) / dist
+        : collisionRepulsion * 0.08 * (softDist - dist) / dist;
+      const push = strength * dtNorm;
+
+      if (!isPined(a.id)) {
+        a.vx -= dx * push;
+        a.vy -= dy * push;
+      }
+      if (!isPined(b.id)) {
+        b.vx += dx * push;
+        b.vy += dy * push;
+      }
+
+      if (dist < minDist) {
+        const nx = dx / dist;
+        const ny = dy / dist;
+        const correction = Math.min((minDist - dist) * 0.5, 10);
+        const aPinned = isPined(a.id);
+        const bPinned = isPined(b.id);
+        if (!aPinned && !bPinned) {
+          a.x -= nx * correction * 0.5;
+          a.y -= ny * correction * 0.5;
+          b.x += nx * correction * 0.5;
+          b.y += ny * correction * 0.5;
+        } else if (!aPinned) {
+          a.x -= nx * correction;
+          a.y -= ny * correction;
+        } else if (!bPinned) {
+          b.x += nx * correction;
+          b.y += ny * correction;
         }
-        if (!isPined(b.id)) {
-          b.vx += dx * push;
-          b.vy += dy * push;
-        }
+      }
+    };
 
-        if (dist < minDist) {
-          const nx = dx / dist;
-          const ny = dy / dist;
-          const correction = Math.min((minDist - dist) * 0.5, 10);
-          const aPinned = isPined(a.id);
-          const bPinned = isPined(b.id);
-          if (!aPinned && !bPinned) {
-            a.x -= nx * correction * 0.5;
-            a.y -= ny * correction * 0.5;
-            b.x += nx * correction * 0.5;
-            b.y += ny * correction * 0.5;
-          } else if (!aPinned) {
-            a.x -= nx * correction;
-            a.y -= ny * correction;
-          } else if (!bPinned) {
-            b.x += nx * correction;
-            b.y += ny * correction;
+    nodes.forEach((node, idx) => {
+      (node as any).__idx = idx;
+    });
+    nodes.forEach(node => {
+      const cx = Math.floor(node.x / cellSize);
+      const cy = Math.floor(node.y / cellSize);
+      for (let gx = cx - 1; gx <= cx + 1; gx++) {
+        for (let gy = cy - 1; gy <= cy + 1; gy++) {
+          const bucket = grid.get((gx * 73856093) ^ (gy * 19349663));
+          if (!bucket) continue;
+          for (const other of bucket) {
+            if ((other as any).__idx <= (node as any).__idx) continue;
+            applyPair(node, other);
           }
         }
       }
-    }
+    });
 
     const liveDegree = new Map<string, number>();
     layoutEdges.current.forEach(edge => {
@@ -406,11 +577,20 @@ export function useGraphLayout(): GraphLayoutResult {
       const edgeDegree = Math.max(liveDegree.get(source.id) ?? 1, liveDegree.get(target.id) ?? 1);
       const degreeResponse = Math.max(0.18, Math.min(1, Math.sqrt(8 / edgeDegree)));
       const weightResponse = Math.max(0.65, Math.min(1.6, Math.sqrt(edge.weight)));
-      const restLength = Math.max(45, springRestLength - Math.min(35, edge.weight * 4));
-      // Clamped so a cross-cluster edge tugs gently instead of dragging its
-      // endpoints off their anchors — anchor gravity must stay the backbone.
-      const displacement = Math.max(-80, Math.min(80, dist - restLength));
-      const spring = connectionPullStrength * 0.002 * weightResponse * degreeResponse * displacement * dtNorm;
+      // Tethered pairs actively converge (agar.io-style): springs are the
+      // dominant force for connected nodes, rest length shrinks with density
+      // and with flow weight so heavy talkers sit closest. Same-subnet pairs
+      // pull into tight grape-clusters; cross-subnet edges are long loose
+      // tethers BETWEEN blobs — that contrast is what makes groups readable.
+      const sameCluster = source.clusterKey === target.clusterKey;
+      const baseRest = Math.min(springRestLength, adaptiveSpacing + NODE_RADIUS * 2 + 15);
+      const tightRest = Math.max(NODE_RADIUS * 2 + adaptiveSpacing + 6, baseRest - Math.min(25, edge.weight * 3));
+      // Cross-blob tethers are long and loose — they must yield to blob
+      // separation, not drag blobs into one mass.
+      const restLength = sameCluster ? tightRest : tightRest + 140;
+      const clusterResponse = sameCluster ? 1.3 : 0.25;
+      const displacement = Math.max(-320, Math.min(320, dist - restLength));
+      const spring = connectionPullStrength * 0.010 * clusterResponse * weightResponse * degreeResponse * displacement * dtNorm;
       const nx = dx / dist;
       const ny = dy / dist;
 
@@ -424,15 +604,6 @@ export function useGraphLayout(): GraphLayoutResult {
       }
     });
 
-    // Anchor gravity: every connected node is pulled toward its deterministic
-    // subnet home, not the screen center — this is the layout's backbone.
-    layoutNodes.current.forEach(node => {
-      if (isPined(node.id) || !connectedIds.has(node.id)) return;
-      const anchorPull = Math.max(centerPullStrength, 0.008);
-      node.vx += (node.homeX - node.x) * anchorPull * dtNorm;
-      node.vy += (node.homeY - node.y) * anchorPull * dtNorm;
-    });
-
     const edgeMargin = 40;
     layoutNodes.current.forEach(node => {
       if (isPined(node.id)) return;
@@ -443,12 +614,15 @@ export function useGraphLayout(): GraphLayoutResult {
       node.x += node.vx * dtNorm;
       node.y += node.vy * dtNorm;
 
-      const width = vp.width || 1280;
-      const height = vp.height || 800;
-      if (node.x < edgeMargin) node.vx += (edgeMargin - node.x) * 0.15 * dtNorm;
-      if (node.x > width - edgeMargin) node.vx -= (node.x - (width - edgeMargin)) * 0.15 * dtNorm;
-      if (node.y < edgeMargin) node.vy += (edgeMargin - node.y) * 0.15 * dtNorm;
-      if (node.y > height - edgeMargin) node.vy -= (node.y - (height - edgeMargin)) * 0.15 * dtNorm;
+      // Hard walls for connected nodes: blob-separation pressure must resolve
+      // as compression on screen, never by shoving the mass out of view. Quiet
+      // nodes are exempt — drifting offscreen is how they exit.
+      if (connectedIds.has(node.id)) {
+        if (node.x < edgeMargin) { node.x = edgeMargin; node.vx = Math.max(0, node.vx); }
+        if (node.x > width - edgeMargin) { node.x = width - edgeMargin; node.vx = Math.min(0, node.vx); }
+        if (node.y < edgeMargin) { node.y = edgeMargin; node.vy = Math.max(0, node.vy); }
+        if (node.y > height - edgeMargin) { node.y = height - edgeMargin; node.vy = Math.min(0, node.vy); }
+      }
     });
   }, []);
 
