@@ -3,7 +3,9 @@ package capture
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -26,11 +28,9 @@ type DumpcapManagerConfig struct {
 }
 
 // syncStderr is a concurrency-safe io.Writer used to capture a child's
-// stderr. It is needed because supervise reaps the process via
-// cmd.Process.Wait() (see the comment on DumpcapManager) rather than
-// cmd.Wait(), which means the os/exec-internal goroutine that copies the
-// stderr pipe into this buffer keeps running independently of — and
-// concurrently with — supervise reading the buffer's contents.
+// stderr. It is written to by a background copy goroutine (see
+// launchLocked/supervise) while supervise may concurrently read it to build
+// an error message, so all access is mutex-guarded.
 type syncStderr struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -55,30 +55,68 @@ type DumpcapManagerStatus struct {
 	LastError string
 }
 
+// errManagerStopping is returned by launchLocked (and thus may surface from
+// Start) when a launch is skipped because Stop has already been called. It
+// is not a real failure — see the DumpcapManager doc comment ("stopping
+// race") — so callers such as supervise's restart path must not treat it as
+// a supervision failure.
+var errManagerStopping = errors.New("dumpcap manager is stopping")
+
 // DumpcapManager launches and supervises a dumpcap child process, restarting
 // it with backoff if it dies unexpectedly, and shutting it down cleanly on
-// Stop. The process is reaped exactly once, by the supervise goroutine —
-// Stop synchronizes with it via waitDone rather than waiting on the process
-// itself, since only one goroutine may wait on a given *os.Process.
+// Stop.
 //
-// supervise reaps via cmd.Process.Wait() rather than cmd.Wait(). The two
-// differ in an important way: cmd.Wait() additionally blocks until the
-// pipes feeding cmd.Stdout/cmd.Stderr have seen EOF, which does not happen
-// until every process holding the write end exits — including grandchildren
-// that inherited the fd (e.g. a child shell backgrounding or exec-ing into
-// another process). A dumpcap child that outlives its immediate parent via
-// such a descendant would otherwise wedge Stop() until that descendant
-// exits. cmd.Process.Wait() reaps strictly by PID and has no such
-// dependency. Since we bypass cmd.Wait(), stderr capture uses syncStderr —
-// os/exec's internal stderr-copying goroutine still runs (started at
-// cmd.Start(), independent of Wait()) and keeps writing to it after the
-// process is reaped, so reads of it must be synchronized.
+// # Single waiter
+//
+// The process is reaped exactly once, by the supervise goroutine, via
+// cmd.Process.Wait() (not cmd.Wait() — see "stderr capture" below for why).
+// Stop never waits on the process itself; it synchronizes with supervise via
+// waitDone (closed by supervise right after the wait call returns), since
+// only one goroutine may ever wait on a given *os.Process.
+//
+// # Stopping race (Finding 1)
+//
+// supervise's restart path re-acquires m.mu twice after leaving its backoff
+// select (once to bump restarts, once inside launchLocked to start the new
+// child) — a window in which a concurrent Stop() could otherwise slip past
+// unnoticed and let a new child spawn after Stop() already declared the
+// manager stopped, leaking an orphan process. launchLocked closes this
+// window by checking m.stopping as the first thing it does under m.mu
+// (which it holds for its entire body): since Stop() also mutates
+// stopping/cmd only under m.mu, whichever of the two wins the lock
+// determines the outcome, and in both orderings no child is spawned after a
+// completed Stop().
+//
+// # stderr capture (Finding 4)
+//
+// supervise reaps via cmd.Process.Wait() rather than cmd.Wait() because
+// cmd.Wait() additionally blocks until the pipes feeding cmd.Stdout/Stderr
+// see EOF, which does not happen until every process holding the write end
+// exits — including grandchildren that inherited the fd (e.g. a child shell
+// backgrounding a long-lived process). A dumpcap child that outlives its
+// immediate parent via such a descendant would otherwise wedge Stop() until
+// that descendant exits (observed directly: a test fixture forking `sleep
+// 60` made Stop() take a full 60s under the naive cmd.Wait() approach).
+//
+// Bypassing cmd.Wait() means we own the stderr pipe ourselves (via
+// cmd.StderrPipe(), drained by our own goroutine into a syncStderr) rather
+// than letting Cmd manage it. After cmd.Process.Wait() returns, supervise
+// gives that drain goroutine a short bounded window (stderrDrainGrace) to
+// finish copying — in the overwhelmingly common case the child's own exit
+// closes its fd 2 (the pipe's write end) and EOF follows within
+// microseconds, so this window makes capture deterministic in practice.
+// The wait is bounded, not unconditional, specifically so a descendant that
+// inherited fd 2 cannot reintroduce the same hang cmd.Wait() had: if the
+// window elapses, supervise proceeds with whatever was captured so far
+// (forcing the drain goroutine to unblock by closing the pipe reader),
+// accepting a truncated message only in that rare pathological case.
 type DumpcapManager struct {
 	cfg      DumpcapManagerConfig
 	mu       sync.Mutex
 	cmd      *exec.Cmd
 	waitDone chan struct{} // closed by supervise after cmd.Process.Wait() returns, for this launch
 	stopping bool
+	stopped  bool // guards Stop() so a second call is a safe no-op (Finding 2)
 	restarts int
 	lastErr  string
 	stopCh   chan struct{}
@@ -148,6 +186,9 @@ func (m *DumpcapManager) Start() error {
 		return fmt.Errorf("cannot create dumpcap output dir: %w", err)
 	}
 	if err := m.launchLocked(); err != nil {
+		// launchLocked only ever returns nil once m.cmd is set (see its doc
+		// comment: every other path returns a non-nil error), so there is no
+		// nil-cmd case to guard against here.
 		return err
 	}
 	m.mu.Lock()
@@ -157,19 +198,49 @@ func (m *DumpcapManager) Start() error {
 	return nil
 }
 
+// stderrDrainGrace bounds how long supervise waits, after reaping the
+// process, for the stderr-drain goroutine to finish copying — see the
+// "stderr capture" section of the DumpcapManager doc comment.
+const stderrDrainGrace = 200 * time.Millisecond
+
+// launchLocked either starts a new child and sets m.cmd, returning nil, or
+// leaves m.cmd exactly as it found it (nil on first launch, nil again if a
+// restart's cmd.Start() failed — see Finding 3 below) and returns a non-nil
+// error. Callers can therefore rely on "err == nil" implying "m.cmd is the
+// newly started process".
 func (m *DumpcapManager) launchLocked() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.stopping {
+		// Finding 1: Stop() won the race for m.mu — do not spawn a child
+		// that nothing will ever signal to stop.
+		return errManagerStopping
+	}
 	cmd := exec.Command(m.cfg.Binary, dumpcapArgs(m.cfg)...)
-	stderr := &syncStderr{}
-	cmd.Stderr = stderr
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create dumpcap stderr pipe: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
+		// Finding 3: clear m.cmd (it may still be pointing at the previous,
+		// already-dead process during a restart) so Status() does not keep
+		// reporting Running=true with a stale PID after a failed restart.
+		m.cmd = nil
+		m.waitDone = nil
+		m.lastErr = fmt.Sprintf("dumpcap failed to start: %v", err)
+		log.Printf("❌ %s", m.lastErr)
 		return fmt.Errorf("failed to start dumpcap: %w", err)
 	}
+	stderr := &syncStderr{}
+	copyDone := make(chan struct{})
+	go func() {
+		io.Copy(stderr, stderrPipe)
+		close(copyDone)
+	}()
 	m.cmd = cmd
 	waitDone := make(chan struct{})
 	m.waitDone = waitDone
-	go m.supervise(cmd, stderr, waitDone)
+	go m.supervise(cmd, stderr, waitDone, stderrPipe, copyDone)
 	return nil
 }
 
@@ -177,9 +248,9 @@ func (m *DumpcapManager) launchLocked() error {
 // entire lifetime of this launch's process and closes waitDone once Wait
 // returns, which is how Stop learns the process has exited without itself
 // waiting on it (that would race with this goroutine's call). See the
-// DumpcapManager doc comment for why this is cmd.Process.Wait() and not
-// cmd.Wait().
-func (m *DumpcapManager) supervise(cmd *exec.Cmd, stderr *syncStderr, waitDone chan struct{}) {
+// DumpcapManager doc comment for the full rationale, including why this is
+// cmd.Process.Wait() and not cmd.Wait().
+func (m *DumpcapManager) supervise(cmd *exec.Cmd, stderr *syncStderr, waitDone chan struct{}, stderrPipe io.ReadCloser, copyDone chan struct{}) {
 	// Note: unlike cmd.Wait(), the error returned by cmd.Process.Wait() does
 	// NOT reflect a non-zero exit code or termination by signal — it is only
 	// non-nil on a wait4(2) syscall failure. Exit status must be read from
@@ -187,6 +258,16 @@ func (m *DumpcapManager) supervise(cmd *exec.Cmd, stderr *syncStderr, waitDone c
 	// cmd.Wait()/exec.ExitError does internally).
 	ps, waitErr := cmd.Process.Wait()
 	close(waitDone)
+
+	// Bounded wait for the stderr-drain goroutine — see "stderr capture" on
+	// the DumpcapManager doc comment. Deterministic in the normal case,
+	// bounded (not hung) in the pathological one.
+	select {
+	case <-copyDone:
+	case <-time.After(stderrDrainGrace):
+	}
+	stderrPipe.Close() // release our read end; also unblocks a still-running drain goroutine
+
 	m.mu.Lock()
 	stopping := m.stopping
 	switch {
@@ -215,7 +296,7 @@ func (m *DumpcapManager) supervise(cmd *exec.Cmd, stderr *syncStderr, waitDone c
 	m.mu.Lock()
 	m.restarts++
 	m.mu.Unlock()
-	if err := m.launchLocked(); err != nil {
+	if err := m.launchLocked(); err != nil && !errors.Is(err, errManagerStopping) {
 		log.Printf("❌ dumpcap restart failed: %v", err)
 	}
 }
@@ -229,6 +310,13 @@ func minInt(a, b int) int {
 
 func (m *DumpcapManager) Stop() {
 	m.mu.Lock()
+	if m.stopped {
+		// Finding 2: a second Stop() is a safe no-op rather than a double
+		// close(m.stopCh) panic.
+		m.mu.Unlock()
+		return
+	}
+	m.stopped = true
 	m.stopping = true
 	cmd := m.cmd
 	waitDone := m.waitDone
@@ -242,8 +330,18 @@ func (m *DumpcapManager) Stop() {
 		select {
 		case <-waitDone:
 		case <-time.After(3 * time.Second):
-			cmd.Process.Kill()
-			<-waitDone // supervise's cmd.Process.Wait() always returns after Kill
+			if err := cmd.Process.Kill(); err != nil {
+				// Finding 5: Kill() can fail (e.g. the process reaped itself
+				// between our timeout firing and the call landing). Don't
+				// assume waitDone will now close promptly — bound the final
+				// wait too, so Stop() always returns.
+				log.Printf("⚠️ dumpcap kill failed (pid %d, may already be gone): %v", cmd.Process.Pid, err)
+			}
+			select {
+			case <-waitDone:
+			case <-time.After(3 * time.Second):
+				log.Printf("⚠️ dumpcap did not report exited within the final grace period — giving up waiting")
+			}
 		}
 	}
 	log.Printf("🛑 dumpcap stopped")
