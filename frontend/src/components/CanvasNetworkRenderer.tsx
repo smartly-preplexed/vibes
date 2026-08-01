@@ -1,12 +1,16 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import { useSizeStore } from '../stores/sizeStore';
-import { useGraphLayout } from '../hooks/useGraphLayout';
+import { useGraphLayout, WORLD_SCALE } from '../hooks/useGraphLayout';
 import { useThemeStore, subnetNodeColor, edgeColor, Theme } from '../stores/themeStore';
+
+// Start zoomed out so the whole (larger-than-viewport) world fits, leaving real
+// room to zoom in. zoom = 1/WORLD_SCALE with pan (0,0) maps world → viewport 1:1.
+const FIT_ZOOM = 1 / WORLD_SCALE;
 
 export const CanvasNetworkRenderer: React.FC = React.memo(() => {
   const canvasRef    = useRef<HTMLCanvasElement>(null);
   const animationRef = useRef<number>();
-  const viewportRef  = useRef({ x: 0, y: 0, zoom: 1.0, width: 0, height: 0 });
+  const viewportRef  = useRef({ x: 0, y: 0, zoom: FIT_ZOOM, width: 0, height: 0 });
   const frameCount   = useRef(0);
   const lastFpsTime  = useRef(0);
   const fpsRef       = useRef(0);
@@ -116,8 +120,12 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
     });
 
     // ── Draw nodes ──────────────────────────────────────────────────────────
-    // Dense populations drown in text — require more zoom before labeling.
-    const labelZoomThreshold = nodes.size > 500 ? 1.6 : nodes.size > 250 ? 1.25 : 0.95;
+    // Labels are readable even at the zoomed-out fit level: font is sized in
+    // constant SCREEN pixels (world font = screenPx / zoom), and overlapping
+    // labels are always culled so overview stays clean — only the labels that
+    // fit without colliding get drawn, more appearing as you zoom in.
+    const labelZoomThreshold = FIT_ZOOM * 0.85; // visible at the default fit zoom
+    const labelScreenPx = nodes.size > 500 ? 9 : 11;
     const labelBoxes: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
     nodes.forEach(node => {
       if (node.alpha <= 0) return;
@@ -148,19 +156,21 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       ctx.fill();
       ctx.globalAlpha = 1;
 
-      // IP labels are a zoomed-in detail. Drawing every label at overview scale
-      // turns dense traffic into text noise and hides the topology.
+      // Label connected nodes (the active conversations). Font is constant on
+      // screen regardless of zoom; overlapping labels are always dropped, so
+      // the overview shows a clean sparse set and detail fills in on zoom-in.
       if (isConnected && node.id.includes('.') && vp.zoom >= labelZoomThreshold) {
-        const fontSize = Math.max(11, 13 * vp.zoom);
+        const fontSize = labelScreenPx / vp.zoom; // constant screen px
         ctx.font      = `${fontSize}px monospace`;
         ctx.textAlign = 'center';
-        const textY = node.y + node.radius + fontSize + 2;
+        const pad = 3 / vp.zoom;
+        const textY = node.y + node.radius + fontSize + pad;
         const tw    = ctx.measureText(node.id).width;
         const labelBox = {
-          x1: node.x - tw / 2 - 4,
-          y1: textY - fontSize - 2,
-          x2: node.x + tw / 2 + 4,
-          y2: textY + 4,
+          x1: node.x - tw / 2 - pad,
+          y1: textY - fontSize - pad,
+          x2: node.x + tw / 2 + pad,
+          y2: textY + pad,
         };
         const overlapsLabel = labelBoxes.some(box =>
           labelBox.x1 < box.x2 &&
@@ -168,10 +178,10 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
           labelBox.y1 < box.y2 &&
           labelBox.y2 > box.y1
         );
-        if (overlapsLabel && vp.zoom < 1.4) return;
+        if (overlapsLabel) return; // always cull overlaps → clean at every zoom
         labelBoxes.push(labelBox);
-        ctx.fillStyle = 'rgba(0,0,0,0.75)';
-        ctx.fillRect(node.x - tw / 2 - 3, textY - fontSize, tw + 6, fontSize + 2);
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(labelBox.x1, labelBox.y1, tw + pad * 2, fontSize + pad * 2);
         ctx.fillStyle = `rgba(${hr},${hg},${hb},${node.alpha})`;
         ctx.fillText(node.id, node.x, textY);
       }
@@ -224,7 +234,7 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       viewportRef.current.y    = wy - my / newZoom;
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'r' || e.key === 'R') { viewportRef.current.x = 0; viewportRef.current.y = 0; viewportRef.current.zoom = 1; }
+      if (e.key === 'r' || e.key === 'R') { viewportRef.current.x = 0; viewportRef.current.y = 0; viewportRef.current.zoom = FIT_ZOOM; }
     };
 
     canvas.addEventListener('mousedown',  onDown);

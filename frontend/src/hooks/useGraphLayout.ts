@@ -42,10 +42,49 @@ export interface GraphLayoutResult {
 
 const PHYSICS_HZ = 30;
 const PHYSICS_STEP = 1000 / PHYSICS_HZ;
-const NODE_RADIUS = 10;
+const NODE_RADIUS = 8;
 const QUIET_EDGE_PADDING = 120;
 const DRIFT_GRACE_MS = 1500;
 const CLUSTER_RADIUS = 110;
+// The virtual "world" is larger than the viewport so there is real room to
+// zoom in. The renderer starts zoomed out to fit WORLD_SCALE and lets the user
+// zoom past 1.0 into the detail.
+export const WORLD_SCALE = 1.8;
+
+// Hex cells in ring order (center first, then expanding rings). Subnets are
+// assigned to these cells by importance, so the busiest subnet sits in the
+// center hex and quieter ones fan outward — "most important right in front".
+function hexCells(count: number): Array<{ q: number; r: number }> {
+  const cells = [{ q: 0, r: 0 }];
+  const dirs = [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]];
+  let ring = 1;
+  while (cells.length < count) {
+    let q = dirs[4][0] * ring;
+    let r = dirs[4][1] * ring;
+    for (let side = 0; side < 6; side++) {
+      for (let i = 0; i < ring; i++) {
+        cells.push({ q, r });
+        q += dirs[side][0];
+        r += dirs[side][1];
+      }
+    }
+    ring++;
+  }
+  return cells.slice(0, count);
+}
+
+// axial hex → pixel offset (flat-ish, pointy-top), scaled by hex size.
+function hexToPixel(q: number, r: number, size: number): { x: number; y: number } {
+  return {
+    x: size * Math.sqrt(3) * (q + r / 2),
+    y: size * 1.5 * r,
+  };
+}
+
+// Rough ring count needed to hold N hex cells (for sizing the hexes to the world).
+function hexRingsFor(count: number): number {
+  return Math.max(1, Math.ceil((Math.sqrt(1 + (4 * Math.max(1, count)) / 3) - 1) / 2));
+}
 
 function getProtocolColor(protocol?: string): string {
   switch (protocol?.toLowerCase()) {
@@ -291,8 +330,11 @@ export function useGraphLayout(): GraphLayoutResult {
 
     const { isPined } = usePinStore.getState();
     const vp = viewportRef.current;
-    const centerX = (vp.width || 1280) / 2;
-    const centerY = (vp.height || 800) / 2;
+    // World is larger than the viewport (WORLD_SCALE) so there's zoom headroom.
+    const worldW = (vp.width || 1280) * WORLD_SCALE;
+    const worldH = (vp.height || 800) * WORLD_SCALE;
+    const centerX = worldW / 2;
+    const centerY = worldH / 2;
     const now = Date.now();
     const retain = Math.pow(Math.max(0, 1 - damping), dtNorm);
     const maxVelocity = 18;
@@ -317,39 +359,28 @@ export function useGraphLayout(): GraphLayoutResult {
     );
     const minPairDist = NODE_RADIUS * 2 + adaptiveSpacing;
 
-    // ── Subnet blobs (tethered agar.io) ──────────────────────────────────────
-    // Each connected node coheres to its subnet's live centroid; blob centroids
-    // repel each other. Edge springs alone cannot separate groups when most
-    // traffic is cross-subnet — every node would get tethered into one ball.
-    const clusterAgg = new Map<string, { sx: number; sy: number; n: number }>();
-    layoutNodes.current.forEach(node => {
-      if (!connectedIds.has(node.id)) return;
-      const agg = clusterAgg.get(node.clusterKey);
-      if (agg) { agg.sx += node.x; agg.sy += node.y; agg.n += 1; }
-      else clusterAgg.set(node.clusterKey, { sx: node.x, sy: node.y, n: 1 });
+    // ── Hex territories for ALL subnets (importance-ordered) ─────────────────
+    // Every subnet gets a hex cell (busiest subnet = center hex, quieter ones
+    // fan outward). QUIET nodes settle firmly into their territory so subnets
+    // spread across the world; CONNECTED nodes get only a whisper of home
+    // tether, so their springs pull them OUT of their territory to aggregate
+    // with live peers — crossing grids toward wherever the conversation is.
+    // Territory is home base, not a cage.
+    const clusterWeight = new Map<string, number>();
+    layoutEdges.current.forEach(e => {
+      if (now - e.lastActive > connectionLifetime) return;
+      const sc = layoutNodes.current.get(e.sourceId)?.clusterKey;
+      const tc = layoutNodes.current.get(e.targetId)?.clusterKey;
+      if (sc) clusterWeight.set(sc, (clusterWeight.get(sc) ?? 0) + e.weight);
+      if (tc) clusterWeight.set(tc, (clusterWeight.get(tc) ?? 0) + e.weight);
     });
+    const allSubnets = new Set<string>();
+    layoutNodes.current.forEach(n => allSubnets.add(n.clusterKey));
 
-    // Blob radii scaled so the demanded areas actually fit the screen.
-    // Unscaled radii make blob-separation demands unsatisfiable — the system
-    // then jams the whole mass against the walls under permanent pressure.
-    let demandedArea = 0;
-    const rawRadius = new Map<string, number>();
-    clusterAgg.forEach((a, key) => {
-      const r = minPairDist * Math.sqrt(a.n / Math.PI) + minPairDist * 0.5;
-      rawRadius.set(key, r);
-      demandedArea += Math.PI * r * r;
-    });
-    const usableArea = (width - 80) * (height - 80);
-    const fit = Math.min(1, Math.sqrt((usableArea * 0.55) / Math.max(1, demandedArea)));
-
-    // ── Deterministic blob placement ─────────────────────────────────────────
-    // Blob positions are computed targets, never force outcomes. Force-based
-    // blob separation has no stable equilibrium when demanded areas exceed the
-    // screen — it jams into walls, orbits, or runs away. Targets can't.
-    clusterAgg.forEach((_, key) => {
+    allSubnets.forEach(key => {
       const slot = clusterSlots.current.get(key);
       if (slot) slot.lastSeen = now;
-      else clusterSlots.current.set(key, { index: nextSlot.current++, lastSeen: now });
+      else clusterSlots.current.set(key, { index: 0, lastSeen: now });
     });
     for (const [key, slot] of clusterSlots.current) {
       if (now - slot.lastSeen > 30000) {
@@ -358,62 +389,46 @@ export function useGraphLayout(): GraphLayoutResult {
       }
     }
 
-    const order = Array.from(clusterAgg.keys())
-      .sort((a, b) => clusterSlots.current.get(a)!.index - clusterSlots.current.get(b)!.index);
-    const placed: Array<{ x: number; y: number; r: number }> = [];
-    const clusters = new Map<string, { cx: number; cy: number; n: number; radius: number }>();
-    for (const key of order) {
-      const r = rawRadius.get(key)! * fit;
-      const slotIndex = clusterSlots.current.get(key)!.index;
-      let tx = centerX;
-      let ty = centerY;
-      if (placed.length > 0) {
-        // Golden-angle spiral: walk outward along this slot's fixed angle
-        // until the blob clears everything already placed.
-        const angle = slotIndex * 2.399963;
-        const ca = Math.cos(angle);
-        const sa = Math.sin(angle);
-        for (let d = 0; d < 2200; d += 14) {
-          tx = centerX + ca * d;
-          ty = centerY + sa * d;
-          if (placed.every(p => {
-            const ddx = tx - p.x;
-            const ddy = ty - p.y;
-            return Math.sqrt(ddx * ddx + ddy * ddy) >= (p.r + r) * 0.92 + adaptiveSpacing;
-          })) break;
-        }
-      }
-      // Keep the blob circle on screen.
-      tx = Math.max(40 + r * 0.7, Math.min(width - 40 - r * 0.7, tx));
-      ty = Math.max(40 + r * 0.7, Math.min(height - 40 - r * 0.7, ty));
-      placed.push({ x: tx, y: ty, r });
+    const orderedSubnets = Array.from(allSubnets).sort((a, b) =>
+      (clusterWeight.get(b) ?? 0) - (clusterWeight.get(a) ?? 0) || a.localeCompare(b));
+    const cells = hexCells(orderedSubnets.length);
+    const rings = hexRingsFor(orderedSubnets.length);
+    const hexSize = Math.min(worldW, worldH) / (2 * (rings + 1.2));
 
-      // Smooth target motion so radius breathing never teleports blobs.
+    const clusterHome = new Map<string, { x: number; y: number }>();
+    orderedSubnets.forEach((key, i) => {
+      const cell = cells[i];
+      const px = hexToPixel(cell.q, cell.r, hexSize);
+      const tx = centerX + px.x;
+      const ty = centerY + px.y;
+      // Smoothed home so a subnet gliding to a new hex (importance shift) flows.
       const t = clusterTargets.current.get(key) ?? { x: tx, y: ty };
-      t.x += (tx - t.x) * 0.03 * dtNorm;
-      t.y += (ty - t.y) * 0.03 * dtNorm;
+      t.x += (tx - t.x) * 0.05 * dtNorm;
+      t.y += (ty - t.y) * 0.05 * dtNorm;
       clusterTargets.current.set(key, t);
-      clusters.set(key, { cx: t.x, cy: t.y, n: clusterAgg.get(key)!.n, radius: r });
-    }
+      clusterHome.set(key, t);
+    });
 
+    // Per-node home = subnet hex center + a deterministic spread within the hex,
+    // so a subnet's quiet nodes fill their territory instead of stacking.
+    const homeSpread = hexSize * 0.6;
     layoutNodes.current.forEach(node => {
-      if (isPined(node.id) || !connectedIds.has(node.id)) return;
-      const c = clusters.get(node.clusterKey);
-      if (!c) return;
-      // Membrane around the blob's TARGET circle: free inside, pulled back
-      // when outside. Repulsion sets the internal density; the gentle inner
-      // pull (centerPullStrength slider) keeps stragglers drifting home.
-      const dcx = c.cx - node.x;
-      const dcy = c.cy - node.y;
-      const dc = Math.sqrt(dcx * dcx + dcy * dcy) || 1;
-      if (dc > c.radius) {
-        const over = (dc - c.radius) / dc;
-        node.vx += dcx * over * 0.035 * dtNorm;
-        node.vy += dcy * over * 0.035 * dtNorm;
-      }
-      const inner = Math.max(centerPullStrength, 0.002);
-      node.vx += dcx * inner * dtNorm;
-      node.vy += dcy * inner * dtNorm;
+      const h = clusterHome.get(node.clusterKey);
+      if (!h) return;
+      const nh = hashStr(node.id);
+      const ang = (nh % 360) * Math.PI / 180;
+      const rad = ((nh >> 9) % 100) / 100 * homeSpread;
+      node.homeX = h.x + Math.cos(ang) * rad;
+      node.homeY = h.y + Math.sin(ang) * rad;
+
+      if (isPined(node.id)) return;
+      // Connected nodes keep a real pull home so subnets hold their territory
+      // and spread across the world; springs still bend them toward live peers,
+      // forming bridges BETWEEN territories rather than one central clump.
+      // Quiet nodes settle firmly into their hex.
+      const homePull = connectedIds.has(node.id) ? 0.009 : 0.02;
+      node.vx += (node.homeX - node.x) * homePull * dtNorm;
+      node.vy += (node.homeY - node.y) * homePull * dtNorm;
     });
 
     const pinnedList = Array.from(layoutNodes.current.values())
@@ -437,35 +452,24 @@ export function useGraphLayout(): GraphLayoutResult {
         return;
       }
 
-      const offscreen = node.x < -250 || node.x > (vp.width || 1280) + 250 ||
-        node.y < -250 || node.y > (vp.height || 800) + 250;
+      // Cull only if a node has drifted far outside the whole WORLD (not the
+      // viewport) — the world is larger than the screen, so most nodes live
+      // off-viewport legitimately and must not be removed.
+      const offscreen = node.x < -300 || node.x > worldW + 300 ||
+        node.y < -300 || node.y > worldH + 300;
       if (offscreen) {
         toRemove.push(node.id);
         return;
       }
 
+      // Connected nodes are opaque; quiet nodes fade over their remaining life
+      // but stay home in their territory (the home-pull above handles position).
       if (connectedIds.has(node.id)) {
         node.alpha = 1;
       } else {
         const fadeAge = Math.max(0, age - connectionLifetime);
         const fadeWindow = Math.max(1, nodeLifetime - connectionLifetime);
         node.alpha = Math.max(0, 1 - fadeAge / fadeWindow);
-
-        // Drift-away applies only to genuinely dead nodes. Nodes that are
-        // traffic-fresh but merely lack a displayed edge (budget rotation)
-        // must NOT get outward kicks — with the mass slightly off-center,
-        // those kicks all point the same way and the whole layout runs away
-        // into a wall.
-        if (age > connectionLifetime + DRIFT_GRACE_MS) {
-          const dx = node.x - centerX;
-          const dy = node.y - centerY;
-          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-          const targetDist = Math.max(vp.width || 1280, vp.height || 800) * 0.5 + QUIET_EDGE_PADDING;
-          const remaining = Math.max(250, nodeLifetime - age);
-          const desiredStep = Math.max(0.8, (targetDist - dist) / (remaining / PHYSICS_STEP));
-          node.vx += (dx / dist) * driftAwayStrength * desiredStep * 0.12 * dtNorm;
-          node.vy += (dy / dist) * driftAwayStrength * desiredStep * 0.12 * dtNorm;
-        }
       }
     });
 
@@ -585,12 +589,14 @@ export function useGraphLayout(): GraphLayoutResult {
       const sameCluster = source.clusterKey === target.clusterKey;
       const baseRest = Math.min(springRestLength, adaptiveSpacing + NODE_RADIUS * 2 + 15);
       const tightRest = Math.max(NODE_RADIUS * 2 + adaptiveSpacing + 6, baseRest - Math.min(25, edge.weight * 3));
-      // Cross-blob tethers are long and loose — they must yield to blob
-      // separation, not drag blobs into one mass.
-      const restLength = sameCluster ? tightRest : tightRest + 140;
-      const clusterResponse = sameCluster ? 1.3 : 0.25;
-      const displacement = Math.max(-320, Math.min(320, dist - restLength));
-      const spring = connectionPullStrength * 0.010 * clusterResponse * weightResponse * degreeResponse * displacement * dtNorm;
+      // Cross-subnet edges are the whole point now: they must pull connected
+      // nodes together ACROSS territories so live conversations aggregate. Only
+      // a slightly longer rest length and modestly softer response than
+      // same-subnet, not the near-zero pull that used to lock nodes home.
+      const restLength = sameCluster ? tightRest : tightRest + 45;
+      const clusterResponse = sameCluster ? 1.25 : 0.9;
+      const displacement = Math.max(-400, Math.min(400, dist - restLength));
+      const spring = connectionPullStrength * 0.007 * clusterResponse * weightResponse * degreeResponse * displacement * dtNorm;
       const nx = dx / dist;
       const ny = dy / dist;
 
@@ -614,15 +620,12 @@ export function useGraphLayout(): GraphLayoutResult {
       node.x += node.vx * dtNorm;
       node.y += node.vy * dtNorm;
 
-      // Hard walls for connected nodes: blob-separation pressure must resolve
-      // as compression on screen, never by shoving the mass out of view. Quiet
-      // nodes are exempt — drifting offscreen is how they exit.
-      if (connectedIds.has(node.id)) {
-        if (node.x < edgeMargin) { node.x = edgeMargin; node.vx = Math.max(0, node.vx); }
-        if (node.x > width - edgeMargin) { node.x = width - edgeMargin; node.vx = Math.min(0, node.vx); }
-        if (node.y < edgeMargin) { node.y = edgeMargin; node.vy = Math.max(0, node.vy); }
-        if (node.y > height - edgeMargin) { node.y = height - edgeMargin; node.vy = Math.min(0, node.vy); }
-      }
+      // Hard walls at the WORLD edges (world is larger than the viewport), so
+      // aggregating masses stay inside the world instead of being shoved out.
+      if (node.x < edgeMargin) { node.x = edgeMargin; node.vx = Math.max(0, node.vx); }
+      if (node.x > worldW - edgeMargin) { node.x = worldW - edgeMargin; node.vx = Math.min(0, node.vx); }
+      if (node.y < edgeMargin) { node.y = edgeMargin; node.vy = Math.max(0, node.vy); }
+      if (node.y > worldH - edgeMargin) { node.y = worldH - edgeMargin; node.vy = Math.min(0, node.vy); }
     });
   }, []);
 
