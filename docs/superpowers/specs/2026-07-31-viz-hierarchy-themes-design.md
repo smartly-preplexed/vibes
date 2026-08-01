@@ -49,9 +49,16 @@ User requirements (from brainstorm):
 - Visual: theme `groupHalo` ring around the group's membrane circle.
 - Hysteresis: join requires the joining edge itself to be ≥ promote-age; demotion only after all group edges have been dead > connectionLifetime; on demotion, members revert to subnet cluster (glide home — no teleport, positions persist).
 
+## 6. GeoIP country flags (added 2026-07-31 per user)
+
+- **Data:** a downloadable IP-block → country dataset (GeoLite2-Country CSV or the CC0 db-ip country-lite equivalent — pick whichever needs no license key at build time; decision at implementation). Backend downloads/caches it on demand (`-geoip-refresh` flag or make target), converts to a compact sorted CIDR → ISO-3166 alpha-2 table served to the frontend once per session (`/api/geoip`, gzipped, ~MBs).
+- **Lookup:** frontend binary-searches the sorted table per node IP (memoized per node). RFC1918/link-local → no flag (home network).
+- **Render:** country's emoji flag (alpha-2 → regional-indicator pair) drawn centered inside the node circle when radius ≥ ~7 px and zoom permits; falls back to nothing when the node is too small. Flag never replaces the subnet hue ring — it sits inside it.
+- **Drill-in readout** gains a country line.
+
 ## Order of implementation
 
-Capture rewrite lands first (separate spec), then this, as: themes (2) → hierarchy (1) → de-noise (3) → drill-in (4) → group promotion (5). Each stage independently shippable and verifiable.
+Capture rewrite lands first (separate spec), then this, as: themes (2) → hierarchy (1) → de-noise (3) → drill-in (4) → group promotion (5) → geo flags (6). Each stage independently shippable and verifiable.
 
 ## Testing (testing/ harness)
 
