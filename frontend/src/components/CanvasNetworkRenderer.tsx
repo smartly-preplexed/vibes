@@ -135,7 +135,9 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       const hr = parseInt(node.highlightColor.slice(1, 3), 16);
       const hg = parseInt(node.highlightColor.slice(3, 5), 16);
       const hb = parseInt(node.highlightColor.slice(5, 7), 16);
-      const isConnected = connectedIds.has(node.id);
+      // Pinned nodes always render as fully-present (and labelled) so the dock
+      // stays legible even when a pin goes momentarily quiet.
+      const isConnected = connectedIds.has(node.id) || node.pinned;
       const visualAlpha = isConnected ? node.alpha : node.alpha * 0.35;
 
       // Node fill: per-subnet hue from the active theme, brighter when talking.

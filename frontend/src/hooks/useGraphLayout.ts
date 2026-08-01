@@ -20,6 +20,7 @@ export interface LayoutNode {
   highlightColor: string;
   alpha: number;
   lastActive: number;
+  pinned: boolean;
 }
 
 export interface LayoutEdge {
@@ -187,6 +188,10 @@ export function useGraphLayout(): GraphLayoutResult {
   const clusterSlots = useRef<Map<string, { index: number; lastSeen: number }>>(new Map());
   const nextSlot = useRef<number>(0);
   const clusterTargets = useRef<Map<string, { x: number; y: number }>>(new Map());
+  // Pinned nodes that have had at least one live connection since page load.
+  // Once here, a node stays docked on screen until refresh even if the store
+  // prunes it — this is what makes pins "sticky" for the whole session.
+  const pinnedSeen = useRef<Set<string>>(new Set());
   const physicsRef = useRef(usePhysicsStore.getState());
   const viewportRef = useRef({ width: 0, height: 0 });
 
@@ -220,12 +225,18 @@ export function useGraphLayout(): GraphLayoutResult {
     const height = vp.height || 800;
 
     const storeById = new Map(storeNodes.map(n => [n.id, n]));
+    const { isPined } = usePinStore.getState();
 
     // Membership hysteresis: a node leaves only when the store drops it or it
     // expires (tickLayout). Never evict by activity rank — rank churn is what
-    // made the old layout teleport.
+    // made the old layout teleport. Exception: a pinned node that has ever
+    // connected stays put even after the store prunes it, so docked pins never
+    // vanish mid-session.
     for (const id of layoutNodes.current.keys()) {
-      if (!storeById.has(id)) layoutNodes.current.delete(id);
+      if (!storeById.has(id) && !(isPined(id) && pinnedSeen.current.has(id))) {
+        layoutNodes.current.delete(id);
+        pinnedSeen.current.delete(id);
+      }
     }
 
     // Refresh nodes already in the layout from their store counterparts.
@@ -326,6 +337,7 @@ export function useGraphLayout(): GraphLayoutResult {
           highlightColor: getHighlightColor(id),
           alpha: 1,
           lastActive: sn.lastActive,
+          pinned: false,
         };
         layoutNodes.current.set(id, newNode);
         if (!clusterSeed.has(clusterKey)) clusterSeed.set(clusterKey, newNode);
@@ -453,6 +465,61 @@ export function useGraphLayout(): GraphLayoutResult {
       clusterHome.set(key, t);
     });
 
+    // ── Pinned nodes dock in a fixed SCREEN-space frame ──────────────────────
+    // Straight down the right edge (below the top-right debug panel), then
+    // wrapping right→left across the bottom; overflow stacks upward so a full
+    // /24 stays on-screen. Positions are screen px converted to world coords
+    // through the live camera, so the dock stays glued to the screen under any
+    // pan/zoom. Placed BEFORE the home loop so neighbours can target the dock.
+    layoutNodes.current.forEach(n => { n.pinned = isPined(n.id); });
+    const pinnedList = Array.from(layoutNodes.current.values())
+      .filter(n => n.pinned)
+      .sort((a, b) => a.id.localeCompare(b.id));
+    const screenW = vp.width || 1280;
+    const screenH = vp.height || 800;
+    const dockRightX = screenW - 55;
+    const dockTopY = 300;
+    const dockBottomY = screenH - 45;
+    const vStep = 46;
+    const hStep = 135;
+    const leftMargin = 60;
+    const rightColCount = Math.max(1, Math.floor((dockBottomY - dockTopY) / vStep));
+    const bottomCols = Math.max(1, Math.floor((dockRightX - leftMargin) / hStep));
+    pinnedList.forEach((node, i) => {
+      let sx: number, sy: number;
+      if (i < rightColCount) {
+        sx = dockRightX;
+        sy = dockTopY + i * vStep;
+      } else {
+        const j = i - rightColCount;
+        const row = Math.floor(j / bottomCols);
+        const colInRow = j % bottomCols;
+        sx = dockRightX - colInRow * hStep;
+        sy = dockBottomY - row * vStep;
+      }
+      node.x = sx / camera.zoom + camera.x;
+      node.y = sy / camera.zoom + camera.y;
+      node.vx = 0;
+      node.vy = 0;
+      node.alpha = 1;                                   // docked pins stay visible
+      if (connectedIds.has(node.id)) pinnedSeen.current.add(node.id); // sticky
+    });
+
+    // Neighbours of pinned nodes get an attractor = the dock position of the
+    // pinned node they talk to (strongest edge wins), so live conversations
+    // migrate UP TO the dock instead of lingering in their home territory.
+    const pinAttractor = new Map<string, { x: number; y: number; w: number }>();
+    layoutEdges.current.forEach(edge => {
+      if (now - edge.lastActive > connectionLifetime) return;
+      const s = layoutNodes.current.get(edge.sourceId);
+      const t = layoutNodes.current.get(edge.targetId);
+      if (!s || !t || s.pinned === t.pinned) return;    // need exactly one pinned
+      const pin = s.pinned ? s : t;
+      const nb = s.pinned ? t : s;
+      const cur = pinAttractor.get(nb.id);
+      if (!cur || edge.weight > cur.w) pinAttractor.set(nb.id, { x: pin.x, y: pin.y, w: edge.weight });
+    });
+
     // Per-node home = subnet hex center + a deterministic spread. Territory SIZE
     // scales with subnet population (radius ∝ √count) so a 240-node subnet fans
     // out across a big disk instead of piling into one hex, while a 2-node subnet
@@ -463,62 +530,34 @@ export function useGraphLayout(): GraphLayoutResult {
       Math.max(hexSize * 0.3, minPairDist * Math.sqrt(subnetPop.get(key) ?? 1) * 0.55);
     layoutNodes.current.forEach(node => {
       const h = clusterHome.get(node.clusterKey);
-      if (!h) return;
-      const nh = hashStr(node.id);
-      const ang = (nh % 360) * Math.PI / 180;
-      const rad = Math.sqrt(((nh >> 9) % 100) / 100) * territoryRadius(node.clusterKey);
-      node.homeX = h.x + Math.cos(ang) * rad;
-      node.homeY = h.y + Math.sin(ang) * rad;
+      if (h) {
+        const nh = hashStr(node.id);
+        const ang = (nh % 360) * Math.PI / 180;
+        const rad = Math.sqrt(((nh >> 9) % 100) / 100) * territoryRadius(node.clusterKey);
+        node.homeX = h.x + Math.cos(ang) * rad;
+        node.homeY = h.y + Math.sin(ang) * rad;
+      }
 
-      if (isPined(node.id)) return;
+      if (node.pinned) return;                          // docked above
+
+      const attractor = pinAttractor.get(node.id);
+      if (attractor) {
+        // Talking to a pinned node → migrate strongly toward its dock. This pull
+        // overrides territory home so even far / long-connected neighbours
+        // travel all the way to the pin and cluster beside it.
+        node.vx += (attractor.x - node.x) * 0.05 * dtNorm;
+        node.vy += (attractor.y - node.y) * 0.05 * dtNorm;
+        return;
+      }
+
+      if (!h) return;
       // Connected nodes keep a real pull home so subnets hold their territory
       // and spread across the world; springs still bend them toward live peers,
       // forming bridges BETWEEN territories rather than one central clump.
-      // Quiet nodes settle firmly into their hex. The connected tether must be
-      // strong enough to resist cross-subnet springs collapsing everything to
-      // world-center (measured: nodes were piling into the middle 40%).
+      // Quiet nodes settle firmly into their hex.
       const homePull = connectedIds.has(node.id) ? 0.02 : 0.028;
       node.vx += (node.homeX - node.x) * homePull * dtNorm;
       node.vy += (node.homeY - node.y) * homePull * dtNorm;
-    });
-
-    // Pinned nodes dock in a fixed SCREEN-space frame: straight down the right
-    // edge (starting below the top-right debug panel), then wrapping right→left
-    // across the bottom. Positions are computed in screen px and converted to
-    // world coords through the live camera, so the dock stays glued to the same
-    // screen spot under any pan or zoom (never falls into the middle).
-    const pinnedList = Array.from(layoutNodes.current.values())
-      .filter(n => isPined(n.id))
-      .sort((a, b) => a.id.localeCompare(b.id));
-    const screenW = vp.width || 1280;
-    const screenH = vp.height || 800;
-    const dockRightX = screenW - 55;   // right column, just inside the edge
-    const dockTopY = 300;              // clear the debug panel in the top-right
-    const dockBottomY = screenH - 45;  // bottom row
-    const vStep = 46;                  // vertical gap down the right column
-    const hStep = 135;                 // horizontal gap across the bottom rows
-    const leftMargin = 60;             // don't let the bottom rows run off-screen
-    const rightColCount = Math.max(1, Math.floor((dockBottomY - dockTopY) / vStep));
-    const bottomCols = Math.max(1, Math.floor((dockRightX - leftMargin) / hStep));
-    pinnedList.forEach((node, i) => {
-      let sx: number, sy: number;
-      if (i < rightColCount) {
-        sx = dockRightX;                       // down the right edge
-        sy = dockTopY + i * vStep;
-      } else {
-        // Then across the bottom, right → left; overflow stacks into rows that
-        // climb upward, keeping the whole dock in the bottom-right frame even
-        // when a full /24 is pinned.
-        const j = i - rightColCount;
-        const row = Math.floor(j / bottomCols);   // 0 = bottom row, stacks up
-        const colInRow = j % bottomCols;          // 0 = rightmost, goes left
-        sx = dockRightX - colInRow * hStep;
-        sy = dockBottomY - row * vStep;
-      }
-      node.x = sx / camera.zoom + camera.x;
-      node.y = sy / camera.zoom + camera.y;
-      node.vx = 0;
-      node.vy = 0;
     });
 
     const toRemove: string[] = [];
@@ -677,8 +716,14 @@ export function useGraphLayout(): GraphLayoutResult {
       // cut hard) so live conversations lean toward each other WITHOUT dragging
       // whole territories into a central hairball. This contrast is what spreads
       // clusters across the screen while keeping connected pairs visibly close.
-      const restLength = sameCluster ? tightRest : tightRest + Math.min(320, hexSize * 0.6);
-      const clusterResponse = sameCluster ? 1.05 : 0.4;
+      // Edges touching a pinned node use a short rest + strong response so the
+      // neighbour sits right beside the dock (the attractor already walks it
+      // there; this keeps it snug instead of held off at a long rest length).
+      const pinEdge = source.pinned || target.pinned;
+      const restLength = pinEdge
+        ? NODE_RADIUS * 2 + adaptiveSpacing * 0.5
+        : sameCluster ? tightRest : tightRest + Math.min(320, hexSize * 0.6);
+      const clusterResponse = pinEdge ? 1.3 : sameCluster ? 1.05 : 0.4;
       const displacement = Math.max(-400, Math.min(400, dist - restLength));
       const spring = connectionPullStrength * 0.007 * clusterResponse * weightResponse * degreeResponse * displacement * dtNorm;
       const nx = dx / dist;
