@@ -104,17 +104,16 @@ export const App = memo(() => {
       return null;
     }
 
-    const wsHost = import.meta.env.VITE_BACKEND_HOST || 'localhost';
-    const wsPort = import.meta.env.VITE_BACKEND_PORT || '8080';
-    const devPorts = ['5173', '3000'];
-    const useViteProxy =
-      import.meta.env.DEV &&
-      !import.meta.env.VITE_BACKEND_HOST &&
-      !import.meta.env.VITE_BACKEND_PORT &&
-      devPorts.includes(window.location.port);
-    const wsBase = useViteProxy
-      ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
-      : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${wsHost}:${wsPort}`;
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    // Connect the WebSocket back to whichever host served this page. An explicit
+    // build-time VITE_BACKEND_HOST wins; otherwise use window.location.host,
+    // which is correct both behind the Vite dev proxy (localhost:5173 → /ws
+    // proxied to :8080) AND when the Go backend serves the built app in
+    // production (e.g. a remote client hitting 10.220.199.71:8080). The old
+    // code hardcoded localhost:8080, so remote clients tried their OWN machine.
+    const wsBase = import.meta.env.VITE_BACKEND_HOST
+      ? `${proto}://${import.meta.env.VITE_BACKEND_HOST}:${import.meta.env.VITE_BACKEND_PORT || '8080'}`
+      : `${proto}://${window.location.host}`;
 
     if (captureMode === 'real') {
       if (selectedInterface) {
