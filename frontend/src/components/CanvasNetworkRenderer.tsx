@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import { useSizeStore } from '../stores/sizeStore';
 import { useGraphLayout } from '../hooks/useGraphLayout';
+import { useThemeStore, subnetNodeColor, edgeColor, Theme } from '../stores/themeStore';
 
 export const CanvasNetworkRenderer: React.FC = React.memo(() => {
   const canvasRef    = useRef<HTMLCanvasElement>(null);
@@ -12,6 +13,14 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
 
   const { width, height } = useSizeStore();
   const { layoutNodes, layoutEdges, tick } = useGraphLayout();
+
+  // Active theme read per-frame via a ref so switching recolors instantly
+  // with zero React re-renders in the render loop.
+  const themeRef = useRef<Theme>(useThemeStore.getState().theme);
+  useEffect(() => {
+    themeRef.current = useThemeStore.getState().theme;
+    return useThemeStore.subscribe(s => { themeRef.current = s.theme; });
+  }, []);
 
   // ── Canvas resize ───────────────────────────────────────────────────────────
   useEffect(() => {
@@ -50,8 +59,10 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       lastFpsTime.current = now;
     }
 
-    // Clear
-    ctx.fillStyle = 'black';
+    const theme = themeRef.current;
+
+    // Clear to the theme background
+    ctx.fillStyle = theme.background;
     ctx.fillRect(0, 0, vp.width, vp.height);
 
     ctx.save();
@@ -83,14 +94,9 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       const weightBoost = Math.max(0.75, Math.min(1.4, Math.sqrt(edge.weight)));
       const edgeAlpha = Math.min(1, edge.alpha * degreeAlpha * weightBoost);
       const weightedWidth = Math.max(1, Math.min(4, 1 + Math.log1p(edge.weight)));
-      let strokeColor = `rgba(0,255,255,${edgeAlpha})`;
-      let lineWidth = weightedWidth;
-      if      (proto === 'tcp')                       { strokeColor = `rgba(0,255,0,${edgeAlpha})`;   lineWidth = weightedWidth; }
-      else if (proto === 'udp')                       { strokeColor = `rgba(255,0,255,${edgeAlpha})`; lineWidth = weightedWidth; }
-      else if (proto === 'icmp')                      { strokeColor = `rgba(255,255,0,${edgeAlpha})`; lineWidth = Math.max(1, weightedWidth - 0.75); }
-      else if (proto === 'http' || proto === 'https') { strokeColor = `rgba(255,165,0,${edgeAlpha})`; lineWidth = weightedWidth; }
+      const lineWidth = proto === 'icmp' ? Math.max(1, weightedWidth - 0.75) : weightedWidth;
 
-      ctx.strokeStyle = strokeColor;
+      ctx.strokeStyle = edgeColor(proto, edgeAlpha, theme);
       ctx.lineWidth   = lineWidth;
       ctx.beginPath();
       ctx.moveTo(src.x, src.y);
@@ -104,7 +110,7 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
         const my    = (src.y + tgt.y) / 2;
         ctx.font      = '9px monospace';
         ctx.textAlign = 'center';
-        ctx.fillStyle = `rgba(0,255,255,${edge.alpha})`;
+        ctx.fillStyle = edgeColor(edge.protocol, edge.alpha, theme);
         ctx.fillText(label, mx, my);
       }
     });
@@ -122,6 +128,10 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       const isConnected = connectedIds.has(node.id);
       const visualAlpha = isConnected ? node.alpha : node.alpha * 0.35;
 
+      // Node fill: per-subnet hue from the active theme, brighter when talking.
+      // This is what makes subnet blobs read as coherent color groups.
+      const bodyColor = subnetNodeColor(node.clusterKey, isConnected ? 1 : 0.35, theme);
+
       // Glow ring for active nodes
       if (node.radius > 7 && isConnected) {
         ctx.fillStyle = `rgba(${hr},${hg},${hb},${visualAlpha * 0.3})`;
@@ -132,7 +142,7 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
 
       // Node body
       ctx.globalAlpha = visualAlpha;
-      ctx.fillStyle   = node.color;
+      ctx.fillStyle   = bodyColor;
       ctx.beginPath();
       ctx.arc(node.x, node.y, isConnected ? node.radius : node.radius * 0.7, 0, Math.PI * 2);
       ctx.fill();

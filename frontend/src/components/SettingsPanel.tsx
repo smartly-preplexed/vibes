@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useNetworkStore } from '../stores/networkStore';
 import { useSettingsStore } from '../stores/settingsStore';
+import { useThemeStore, THEMES } from '../stores/themeStore';
 import { FiWifi, FiSliders } from 'react-icons/fi';
 import { PhysicsPanel } from './PhysicsPanel';
 
@@ -36,6 +37,7 @@ export const SettingsPanel: React.FC<{
   const ifaceRef = useRef<HTMLDivElement>(null);
   const { clearNetwork } = useNetworkStore();
   const { maxNodes, setMaxNodes, maxConnectionsPerNode, setMaxConnectionsPerNode } = useSettingsStore();
+  const { themeKey, setTheme } = useThemeStore();
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -79,6 +81,19 @@ export const SettingsPanel: React.FC<{
       <div className="tab-content">
         {activeTab === 'network' && (
           <div style={{marginTop: '20px'}}>
+            <h3>Theme</h3>
+            <div className="button-group">
+              {Object.values(THEMES).map(t => (
+                <button
+                  key={t.key}
+                  className={themeKey === t.key ? 'active' : ''}
+                  onClick={() => setTheme(t.key)}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
             <h3>Capture Mode</h3>
             <div className="button-group">
               <button

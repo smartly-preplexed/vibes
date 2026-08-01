@@ -38,22 +38,22 @@ const StatusBar = memo(({ status, error }: { status: string; error: string | nul
       
       
       {/* Active Panel - Shows current network activity */}
-      <div style={{ 
-        display: 'flex', 
-        alignItems: 'center', 
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
         gap: '15px',
         fontSize: '14px',
-        color: '#00ff00'
+        color: 'var(--vibes-primary, #00ff00)'
       }}>
         <span>📦 Packets: <strong style={{ color: '#fff' }}>{packets.length}</strong></span>
         <span>🔘 Nodes: <strong style={{ color: '#fff' }}>{nodes.length}</strong></span>
         <span>🔗 Connections: <strong style={{ color: '#fff' }}>{connections.length}</strong></span>
-        <span style={{ 
-          fontSize: '12px', 
-          padding: '2px 6px', 
-          background: nodes.length > 0 ? 'rgba(0, 255, 0, 0.2)' : 'rgba(255, 0, 0, 0.2)',
+        <span style={{
+          fontSize: '12px',
+          padding: '2px 6px',
+          background: nodes.length > 0 ? 'rgba(var(--vibes-primary-rgb, 0, 255, 0), 0.2)' : 'rgba(255, 0, 0, 0.2)',
           borderRadius: '3px',
-          border: `1px solid ${nodes.length > 0 ? '#00ff00' : '#ff0000'}`
+          border: `1px solid ${nodes.length > 0 ? 'var(--vibes-primary, #00ff00)' : '#ff0000'}`
         }}>
           {nodes.length > 0 ? '✅ ACTIVE' : '⚠️ WAITING'}
         </span>

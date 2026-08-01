@@ -9,8 +9,8 @@
 }
 
 body {
-  background: #000;
-  color: #00ff00;
+  background: var(--vibes-bg, #000);
+  color: var(--vibes-primary, #00ff00);
   font-family: 'VT323', monospace;
   font-display: swap; /* Prevent FOIT */
   overflow: hidden;
@@ -23,10 +23,10 @@ body {
   top: 20px;
   left: 20px;
   background: rgba(0, 0, 0, 0.8);
-  border: 1px solid #00ff00;
+  border: 1px solid var(--vibes-primary, #00ff00);
   border-radius: 4px;
   padding: 20px;
-  color: #00ff00;
+  color: var(--vibes-primary, #00ff00);
   font-family: 'VT323', monospace;
   z-index: 1000;
   width: 320px;
@@ -41,8 +41,8 @@ body {
 
 .minimize-btn {
   background: none;
-  border: 1px solid #00ff00;
-  color: #00ff00;
+  border: 1px solid var(--vibes-primary, #00ff00);
+  color: var(--vibes-primary, #00ff00);
   font-family: 'VT323', monospace;
   font-size: 18px;
   cursor: pointer;
@@ -51,7 +51,7 @@ body {
 }
 
 .minimize-btn:hover {
-  background: rgba(0, 255, 0, 0.2);
+  background: rgba(var(--vibes-primary-rgb, 0, 255, 0),0.2);
 }
 
 .settings-button {
@@ -86,8 +86,8 @@ body {
 
 .button-group button {
   background: rgba(0, 0, 0, 0.7);
-  border: 1px solid #00ff00;
-  color: #00ff00;
+  border: 1px solid var(--vibes-primary, #00ff00);
+  color: var(--vibes-primary, #00ff00);
   padding: 8px 6px;
   font-family: 'VT323', monospace;
   font-size: 17px;
@@ -103,14 +103,14 @@ body {
 }
 
 .button-group button:hover {
-  background: rgba(0, 255, 0, 0.2);
-  box-shadow: 0 0 15px rgba(0, 255, 0, 0.5);
+  background: rgba(var(--vibes-primary-rgb, 0, 255, 0),0.2);
+  box-shadow: 0 0 15px rgba(var(--vibes-primary-rgb, 0, 255, 0),0.5);
 }
 
 .button-group button.active {
-  background: #00ff00;
+  background: var(--vibes-primary, #00ff00);
   color: #000;
-  box-shadow: 0 0 15px #00ff00;
+  box-shadow: 0 0 15px var(--vibes-primary, #00ff00);
 }
 
 /* Pulsing effect for "Real" button to draw attention */
@@ -119,14 +119,14 @@ body {
 }
 
 @keyframes pulse-border {
-  0% { box-shadow: 0 0 0 0 rgba(0, 255, 0, 0.7); }
-  70% { box-shadow: 0 0 0 10px rgba(0, 255, 0, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(0, 255, 0, 0); }
+  0% { box-shadow: 0 0 0 0 rgba(var(--vibes-primary-rgb, 0, 255, 0),0.7); }
+  70% { box-shadow: 0 0 0 10px rgba(var(--vibes-primary-rgb, 0, 255, 0),0); }
+  100% { box-shadow: 0 0 0 0 rgba(var(--vibes-primary-rgb, 0, 255, 0),0); }
 }
 
 .interface-select {
   margin-top: 15px;
-  border: 2px solid #00ff00;
+  border: 2px solid var(--vibes-primary, #00ff00);
   padding: 15px;
   background: rgba(0, 0, 0, 0.7);
   border-radius: 4px;
@@ -134,15 +134,15 @@ body {
 }
 
 @keyframes highlight-border {
-  0% { box-shadow: 0 0 5px #00ff00; }
-  50% { box-shadow: 0 0 15px #00ff00; }
-  100% { box-shadow: 0 0 5px #00ff00; }
+  0% { box-shadow: 0 0 5px var(--vibes-primary, #00ff00); }
+  50% { box-shadow: 0 0 15px var(--vibes-primary, #00ff00); }
+  100% { box-shadow: 0 0 5px var(--vibes-primary, #00ff00); }
 }
 
 .interface-select h3 {
   margin: 0 0 10px 0;
   font-size: 18px;
-  color: #00ff00;
+  color: var(--vibes-primary, #00ff00);
   text-transform: uppercase;
   letter-spacing: 1px;
 }
@@ -150,8 +150,8 @@ body {
 .interface-select select {
   width: 100%;
   background: rgba(0, 0, 0, 0.8);
-  border: 1px solid #00ff00;
-  color: #00ff00;
+  border: 1px solid var(--vibes-primary, #00ff00);
+  color: var(--vibes-primary, #00ff00);
   padding: 12px;
   font-family: 'VT323', monospace;
   font-size: 18px;
@@ -161,20 +161,20 @@ body {
   appearance: none; /* Remove default OS styling */
   -webkit-appearance: none;
   -moz-appearance: none;
-  background-image: linear-gradient(45deg, transparent 50%, #00ff00 50%),
-                    linear-gradient(135deg, #00ff00 50%, transparent 50%);
+  background-image: linear-gradient(45deg, transparent 50%, var(--vibes-primary, #00ff00) 50%),
+                    linear-gradient(135deg, var(--vibes-primary, #00ff00) 50%, transparent 50%);
   background-position: calc(100% - 15px) center, calc(100% - 10px) center;
   background-size: 5px 5px, 5px 5px;
   background-repeat: no-repeat;
 }
 
 .interface-select select:focus {
-  box-shadow: 0 0 10px #00ff00;
+  box-shadow: 0 0 10px var(--vibes-primary, #00ff00);
 }
 
 .interface-select select option {
   background: #000;
-  color: #00ff00;
+  color: var(--vibes-primary, #00ff00);
   padding: 10px;
 }
 
@@ -184,10 +184,10 @@ body {
   top: 20px;
   right: 20px;
   background: rgba(0, 0, 0, 0.8);
-  border: 1px solid #00ff00;
+  border: 1px solid var(--vibes-primary, #00ff00);
   border-radius: 4px;
   padding: 20px;
-  color: #00ff00;
+  color: var(--vibes-primary, #00ff00);
   font-family: 'VT323', monospace;
   z-index: 1000;
   width: 300px; /* Fixed width */
@@ -207,9 +207,9 @@ body {
   left: 0;
   right: 0;
   background: rgba(0, 0, 0, 0.9);
-  border-top: 1px solid #00ff00;
+  border-top: 1px solid var(--vibes-primary, #00ff00);
   padding: 8px 20px;
-  color: #00ff00;
+  color: var(--vibes-primary, #00ff00);
   font-family: 'VT323', monospace;
   display: flex;
   justify-content: space-between;
@@ -239,7 +239,7 @@ body {
 }
 
 .status.connected::before {
-  background: #00ff00;
+  background: var(--vibes-primary, #00ff00);
 }
 
 .status.disconnected::before {
@@ -414,7 +414,7 @@ body {
   position: absolute;
   left: 10px;
   top: 10px;
-  color: #00ff00;
+  color: var(--vibes-primary, #00ff00);
   pointer-events: none;
   font-size: 16px;
   font-family: 'VT323', monospace;
@@ -427,8 +427,8 @@ body {
 
 .command-input-editor {
   background: rgba(0, 0, 0, 0.7);
-  border: 1px solid #00ff00;
-  color: #00ff00;
+  border: 1px solid var(--vibes-primary, #00ff00);
+  color: var(--vibes-primary, #00ff00);
   font-family: 'VT323', monospace;
   font-size: 16px;
   width: 100%;
@@ -441,7 +441,7 @@ body {
 }
 
 .command-input::placeholder {
-  color: rgba(0, 255, 0, 0.5);
+  color: rgba(var(--vibes-primary-rgb, 0, 255, 0),0.5);
 }
 
 .console-output {
@@ -451,12 +451,12 @@ body {
   width: 100%; /* Match the width of the container */
   height: 200px; /* Max height for 10 lines */
   background: rgba(0, 0, 0, 0.85);
-  border-top: 1px solid #00ff00;
-  border-left: 1px solid #00ff00;
-  border-right: 1px solid #00ff00;
+  border-top: 1px solid var(--vibes-primary, #00ff00);
+  border-left: 1px solid var(--vibes-primary, #00ff00);
+  border-right: 1px solid var(--vibes-primary, #00ff00);
   padding: 10px;
   overflow-y: auto;
-  color: #00ff00;
+  color: var(--vibes-primary, #00ff00);
   font-family: 'VT323', monospace;
   font-size: 16px;
   line-height: 1.2;
@@ -477,7 +477,7 @@ body {
 
 .command-input-editor textarea:focus {
   outline: none;
-  box-shadow: 0 0 10px rgba(0, 255, 0, 0.5);
+  box-shadow: 0 0 10px rgba(var(--vibes-primary-rgb, 0, 255, 0),0.5);
 }
 
 .command-input-editor .token.keyword {
@@ -493,7 +493,7 @@ body {
 }
 
 .command-input-editor .token.number {
-  color: #00ff00; /* Green for numbers/IPs */
+  color: var(--vibes-primary, #00ff00); /* Green for numbers/IPs */
 }
 
 .command-input-editor .token.operator {
