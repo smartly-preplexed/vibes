@@ -754,7 +754,17 @@ func main() {
 		})
 	})
 
+	// Serve the built frontend from ./public with SPA fallback: real asset
+	// files (JS/CSS/favicon) are served directly; any other path returns
+	// index.html so client-side routing works.
+	publicFS := http.FileServer(http.Dir("public"))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			if fi, err := os.Stat("public" + r.URL.Path); err == nil && !fi.IsDir() {
+				publicFS.ServeHTTP(w, r)
+				return
+			}
+		}
 		http.ServeFile(w, r, "public/index.html")
 	})
 

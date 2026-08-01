@@ -148,7 +148,10 @@ func NewDumpcapManager(cfg DumpcapManagerConfig) *DumpcapManager {
 	if cfg.FileSizeMB <= 0 {
 		cfg.FileSizeMB = 500
 	}
-	if cfg.RingFiles <= 0 {
+	// RingFiles: >0 caps the ring at N files (oldest overwritten); ==0 means
+	// retain-all (rotate by size, never delete — for archival captures);
+	// <0 is treated as "unset" and gets the default cap.
+	if cfg.RingFiles < 0 {
 		cfg.RingFiles = 20
 	}
 	if cfg.BufferMB <= 0 {
@@ -165,14 +168,19 @@ func NewDumpcapManager(cfg DumpcapManagerConfig) *DumpcapManager {
 
 func dumpcapArgs(cfg DumpcapManagerConfig) []string {
 	out := filepath.Join(cfg.OutputDir, fmt.Sprintf("vibes_%s.pcap", cfg.Iface))
-	return []string{
+	args := []string{
 		"-i", cfg.Iface,
 		"-P",
 		"-B", fmt.Sprintf("%d", cfg.BufferMB),
 		"-b", fmt.Sprintf("filesize:%d", cfg.FileSizeMB*1024), // dumpcap unit: KB
-		"-b", fmt.Sprintf("files:%d", cfg.RingFiles),
-		"-w", out,
 	}
+	// Cap the ring only when RingFiles > 0. RingFiles == 0 → retain all files
+	// (rotate by size, never wrap) for archival captures.
+	if cfg.RingFiles > 0 {
+		args = append(args, "-b", fmt.Sprintf("files:%d", cfg.RingFiles))
+	}
+	args = append(args, "-w", out)
+	return args
 }
 
 func preflightAdvice(goos string) string {

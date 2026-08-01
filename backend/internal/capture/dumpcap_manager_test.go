@@ -29,6 +29,19 @@ func TestDumpcapArgs(t *testing.T) {
 			t.Errorf("args missing %q in %q", want, joined)
 		}
 	}
+
+	// RingFiles == 0 → retain-all: rotate by size, no files: cap.
+	retain := dumpcapArgs(DumpcapManagerConfig{
+		Iface: "ens3np0", OutputDir: "/data/bhusa2026",
+		FileSizeMB: 2000, RingFiles: 0, BufferMB: 1024,
+	})
+	rj := strings.Join(retain, " ")
+	if !strings.Contains(rj, "-b filesize:2048000") {
+		t.Errorf("retain-all missing size rotation in %q", rj)
+	}
+	if strings.Contains(rj, "files:") {
+		t.Errorf("retain-all must NOT cap the ring (no files:), got %q", rj)
+	}
 }
 
 func TestPreflightAdvice(t *testing.T) {
