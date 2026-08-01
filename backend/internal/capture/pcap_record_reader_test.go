@@ -144,6 +144,38 @@ func TestRecordReaderRejectsBadMagic(t *testing.T) {
 	}
 }
 
+// TestRecordReaderSeekToEndSkipsExistingRecords covers the primitive Finding
+// F1's cold-start tail relies on: after SeekToEnd, pre-existing records must
+// not be replayed, but records appended afterward must still be delivered.
+func TestRecordReaderSeekToEndSkipsExistingRecords(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTestPcap(t, dir, "seek.pcap", 5)
+	r, err := newPcapRecordReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if err := r.SeekToEnd(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := r.Next(); err != nil || ok {
+		t.Fatalf("expected no record immediately after SeekToEnd, got ok=%v err=%v", ok, err)
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := pcapgo.NewWriter(f) // appending; header already written
+	appendTestPackets(t, f, w, 3)
+	f.Close()
+
+	if got := drainAll(t, r); got != 3 {
+		t.Fatalf("after SeekToEnd + append: got %d, want 3 (must not replay the pre-existing 5)", got)
+	}
+}
+
 func TestRecordReaderIncompleteHeader(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "short.pcap")

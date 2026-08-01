@@ -31,6 +31,11 @@ type DumpcapManagerConfig struct {
 	RingFiles          int // ring length, default 20
 	BufferMB           int // dumpcap -B, default 1024 (BH-2025-proven)
 	RestartBackoffBase time.Duration
+	// HealthyResetDuration is how long a child must stay alive for its death
+	// to no longer compound the restart backoff (T5-backoff spec: "reset
+	// after 60s healthy"). Default 60s. Exposed here (rather than hardcoded)
+	// so tests can inject a short threshold instead of waiting a real 60s.
+	HealthyResetDuration time.Duration
 }
 
 // syncStderr is a concurrency-safe io.Writer used to capture a child's
@@ -124,8 +129,16 @@ type DumpcapManager struct {
 	stopping bool
 	stopped  bool // guards Stop() so a second call is a safe no-op (Finding 2)
 	restarts int
-	lastErr  string
-	stopCh   chan struct{}
+	// consecutiveRestarts drives the exponential backoff (T5-backoff spec
+	// deviation fix). Unlike restarts (the monotonic lifetime counter
+	// reported by Status()), this resets to 0 whenever the child that just
+	// died had been running for >= cfg.HealthyResetDuration — so a capture
+	// that's been healthy for a while doesn't inherit a maxed-out backoff
+	// from restarts months earlier in the process's lifetime.
+	consecutiveRestarts int
+	launchTime          time.Time // when the current/most recent child was started
+	lastErr             string
+	stopCh              chan struct{}
 }
 
 func NewDumpcapManager(cfg DumpcapManagerConfig) *DumpcapManager {
@@ -143,6 +156,9 @@ func NewDumpcapManager(cfg DumpcapManagerConfig) *DumpcapManager {
 	}
 	if cfg.RestartBackoffBase <= 0 {
 		cfg.RestartBackoffBase = time.Second
+	}
+	if cfg.HealthyResetDuration <= 0 {
+		cfg.HealthyResetDuration = 60 * time.Second
 	}
 	return &DumpcapManager{cfg: cfg, stopCh: make(chan struct{})}
 }
@@ -352,6 +368,7 @@ func (m *DumpcapManager) launchLocked() error {
 		close(copyDone)
 	}()
 	m.cmd = cmd
+	m.launchTime = time.Now()
 	waitDone := make(chan struct{})
 	m.waitDone = waitDone
 	go m.supervise(cmd, stderr, waitDone, stderrPipe, copyDone)
@@ -384,6 +401,15 @@ func (m *DumpcapManager) supervise(cmd *exec.Cmd, stderr *syncStderr, waitDone c
 
 	m.mu.Lock()
 	stopping := m.stopping
+	// T5-backoff: if the child that just died had been running for at least
+	// HealthyResetDuration, treat it as having recovered — reset the
+	// consecutive-restart counter before computing this death's backoff, so
+	// a long-lived capture doesn't inherit a maxed-out (up to 30s) backoff
+	// from a burst of restarts long in the past. m.restarts (the monotonic
+	// lifetime counter reported by Status()) is untouched.
+	if !m.launchTime.IsZero() && time.Since(m.launchTime) >= m.cfg.HealthyResetDuration {
+		m.consecutiveRestarts = 0
+	}
 	switch {
 	case waitErr != nil:
 		m.lastErr = fmt.Sprintf("dumpcap wait failed: %v", waitErr)
@@ -392,12 +418,12 @@ func (m *DumpcapManager) supervise(cmd *exec.Cmd, stderr *syncStderr, waitDone c
 	default:
 		m.lastErr = "dumpcap exited cleanly"
 	}
-	restarts := m.restarts
+	consecutiveRestarts := m.consecutiveRestarts
 	m.mu.Unlock()
 	if stopping {
 		return
 	}
-	backoff := m.cfg.RestartBackoffBase * (1 << uint(minInt(restarts, 5)))
+	backoff := m.cfg.RestartBackoffBase * (1 << uint(minInt(consecutiveRestarts, 5)))
 	if backoff > 30*time.Second {
 		backoff = 30 * time.Second
 	}
@@ -409,6 +435,7 @@ func (m *DumpcapManager) supervise(cmd *exec.Cmd, stderr *syncStderr, waitDone c
 	}
 	m.mu.Lock()
 	m.restarts++
+	m.consecutiveRestarts++
 	m.mu.Unlock()
 	if err := m.launchLocked(); err != nil && !errors.Is(err, errManagerStopping) {
 		log.Printf("❌ dumpcap restart failed: %v", err)

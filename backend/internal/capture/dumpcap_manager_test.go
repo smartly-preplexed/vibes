@@ -293,6 +293,69 @@ func TestManagerStatusReflectsFailedRestart(t *testing.T) {
 	t.Fatalf("expected Status to report a failed restart, got %+v", m.Status())
 }
 
+// T5-backoff: the restart backoff must reset after a child has been healthy
+// (alive) for >= HealthyResetDuration, rather than compounding forever off
+// the monotonic lifetime restart count. Launches 1 and 2 die immediately
+// (compounding the consecutive-restart counter); launch 3 lives past the
+// injected short HealthyResetDuration before dying, which must reset the
+// counter, so the delay before launch 4 collapses back down near the base
+// backoff instead of continuing to grow.
+func TestManagerBackoffResetsAfterHealthyChild(t *testing.T) {
+	countFile := filepath.Join(t.TempDir(), "launches")
+	bin := fakeScript(t, fmt.Sprintf(`if [ "$3" = "-c" ]; then echo "1. lo"; exit 0; fi
+echo x >> %q
+n=$(wc -l < %q)
+if [ "$n" -ge 3 ]; then
+  sleep 0.2
+fi
+exit 1`, countFile, countFile))
+	m := NewDumpcapManager(DumpcapManagerConfig{
+		Binary: bin, Iface: "lo", OutputDir: t.TempDir(),
+		RestartBackoffBase:   40 * time.Millisecond,
+		HealthyResetDuration: 150 * time.Millisecond,
+	})
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	// Poll the launches file and stamp a wall-clock time the first moment
+	// each new launch is observed, so we can measure inter-launch delays
+	// without relying on the (BSD date has no portable sub-second) shell.
+	var timestamps []time.Time
+	seen := 0
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) && len(timestamps) < 4 {
+		n := countLaunches(t, countFile)
+		for seen < n {
+			timestamps = append(timestamps, time.Now())
+			seen++
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if len(timestamps) < 4 {
+		t.Fatalf("expected 4 launches within the deadline, observed %d", len(timestamps))
+	}
+
+	delta34 := timestamps[3].Sub(timestamps[2])
+	t.Logf("inter-launch deltas: 1->2=%s 2->3=%s 3->4=%s",
+		timestamps[1].Sub(timestamps[0]), timestamps[2].Sub(timestamps[1]), delta34)
+
+	// Launch 3 lived ~200ms (its sleep) before dying, past the 150ms
+	// HealthyResetDuration, so it must reset consecutiveRestarts to 0 before
+	// the backoff for launch 4 is computed. Without the fix,
+	// consecutiveRestarts would still be 2 at that point (from launches 1
+	// and 2 dying immediately), giving a backoff of base*2^2=160ms on top of
+	// the 200ms sleep — delta34 >= ~360ms. With the fix it collapses to
+	// base*2^0=40ms on top of the 200ms sleep — delta34 ~= 240ms.
+	if delta34 >= 320*time.Millisecond {
+		t.Fatalf("delta34 = %s, want < 320ms — backoff did not reset after a healthy (>=150ms-lived) child", delta34)
+	}
+	if delta34 < 150*time.Millisecond {
+		t.Fatalf("delta34 = %s, suspiciously low — launch 3 should have lived ~200ms before its backoff-delayed successor", delta34)
+	}
+}
+
 // Finding 4: stderr from a dying child must be captured in full, not
 // truncated by a race between supervise reading it and the background copy
 // goroutine still writing it.

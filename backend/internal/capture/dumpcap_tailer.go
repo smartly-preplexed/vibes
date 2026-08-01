@@ -13,6 +13,9 @@ import (
 const (
 	tailerPollInterval = 250 * time.Millisecond
 	tailerDrainBudget  = 20 * time.Millisecond
+	// dropLogInterval controls how often the tailer reports accumulated
+	// packetsDropped (channel-full drops) via a log line, per Finding F3.
+	dropLogInterval = 5 * time.Second
 )
 
 type DumpcapTailerStats struct {
@@ -49,6 +52,20 @@ type DumpcapTailer struct {
 	// failed to open with a permanent (non-retryable) error. Keyed by path.
 	// Pruned as files disappear from the directory listing to bound memory.
 	visited map[string]bool
+	// started is false until the tailer has made its very first file
+	// selection. That first selection is special-cased (see
+	// selectNewestAtEnd, Finding F1): it tails the newest ring file from its
+	// live end rather than draining the ring from the oldest file, so a
+	// fresh tailer (e.g. one created per WebSocket connection against a
+	// long-lived multi-GB ring) never replays hours of stale packets as if
+	// they were live. Every selection after the first uses the normal
+	// oldest-first drain-then-switch behavior regardless of this flag.
+	started bool
+	// lastLoggedFatalPath records the path a fatal record error was last
+	// logged for, so a persistently corrupt file (the sole remaining
+	// candidate, with nowhere to advance to) logs once instead of flooding
+	// at poll frequency (Finding F5).
+	lastLoggedFatalPath string
 
 	packetsRead    uint64
 	packetsDropped uint64
@@ -110,20 +127,37 @@ func (t *DumpcapTailer) Stats() DumpcapTailerStats {
 }
 
 func (t *DumpcapTailer) loop() {
+	// Finding F2: unlike every other PacketCapture implementation, this
+	// tailer used to close(t.packetChan) here. That's the one channel the
+	// main.go forwarder reads from with no closed-channel check, so it would
+	// busy-spin at 100% CPU on the zero-value receive after Stop(). Leave
+	// the channel open on exit — it matches package convention (all other
+	// captures do the same) and GC reclaims it once nothing references it.
 	defer func() {
 		if t.reader != nil {
 			t.reader.Close()
 		}
-		close(t.packetChan)
 	}()
 	ticker := time.NewTicker(t.pollInterval)
 	defer ticker.Stop()
+	// Finding F3: report accumulated packetsDropped periodically so a full
+	// channel (consumer can't keep up) is visible in the logs instead of
+	// silently incrementing a counter nobody reads.
+	dropTicker := time.NewTicker(dropLogInterval)
+	defer dropTicker.Stop()
+	var lastLoggedDropped uint64
 	for {
 		select {
 		case <-t.stopChan:
 			return
 		case <-ticker.C:
 			t.pollOnce()
+		case <-dropTicker.C:
+			total := atomic.LoadUint64(&t.packetsDropped)
+			if total > lastLoggedDropped {
+				log.Printf("⚠️ dumpcap tailer dropped %d packets (channel full; total %d)", total-lastLoggedDropped, total)
+				lastLoggedDropped = total
+			}
 		}
 	}
 }
@@ -135,9 +169,18 @@ func (t *DumpcapTailer) pollOnce() {
 	}
 	t.pruneVisited(files)
 
-	// No current target yet: pick the first unvisited candidate.
+	// No current target yet: pick a candidate. The very first selection this
+	// tailer instance ever makes is special-cased (Finding F1) — it tails
+	// the newest ring file from its live end instead of draining the ring
+	// oldest-first, so a fresh tailer never replays pre-existing (stale)
+	// ring contents. Every subsequent selection uses the normal
+	// oldest-first drain-then-switch logic.
 	if t.currentPath == "" {
-		t.selectNext(files)
+		if !t.started {
+			t.selectNewestAtEnd(files)
+		} else {
+			t.selectNext(files)
+		}
 		if t.currentPath == "" {
 			return // nothing available (all visited, or all corrupt)
 		}
@@ -183,8 +226,17 @@ func (t *DumpcapTailer) drain() int {
 	for time.Now().Before(deadline) {
 		data, ok, err := t.reader.Next()
 		if err != nil {
-			log.Printf("⚠️ dumpcap tailer: fatal error in %s (%v) — advancing", t.currentPath, err)
-			t.emptyDrains = 2 // force advance on next opportunity
+			// Finding F5: log this once per file, not on every poll (a
+			// persistently corrupt file with no other candidate to advance
+			// to would otherwise hit this every ~250ms forever). Also don't
+			// claim "advancing" — whether an advance actually happens
+			// depends on whether pollOnce finds another unvisited
+			// candidate, which isn't known here.
+			if t.lastLoggedFatalPath != t.currentPath {
+				log.Printf("⚠️ dumpcap tailer: fatal error in %s (%v)", t.currentPath, err)
+				t.lastLoggedFatalPath = t.currentPath
+			}
+			t.emptyDrains = 2 // force an advance-or-retry check on next opportunity
 			return count
 		}
 		if !ok {
@@ -245,6 +297,34 @@ func (t *DumpcapTailer) pruneVisited(files []ringFile) {
 	}
 }
 
+// selectNewestAtEnd performs the tailer's one-time cold-start selection
+// (Finding F1): it marks every file except the newest (last in
+// discoverRingFiles' oldest-first order) as visited — so the tailer never
+// walks back through pre-existing ring contents — and opens the newest file
+// positioned at its current end, so only packets appended from this point
+// on are delivered. Called at most once per tailer instance, for the very
+// first selection (see the `started` field).
+func (t *DumpcapTailer) selectNewestAtEnd(files []ringFile) {
+	t.started = true
+	if t.reader != nil {
+		t.reader.Close()
+		t.reader = nil
+	}
+	t.currentPath = ""
+	t.currentMu.Store("")
+
+	newest := files[len(files)-1]
+	for _, f := range files[:len(files)-1] {
+		t.markVisited(f.Path)
+	}
+	t.openFileAt(newest.Path, true)
+	// If the newest file turned out permanently corrupt, openFileAt already
+	// marked it visited and left currentPath == "". Since every older file
+	// was also just marked visited above, pollOnce's normal selectNext path
+	// will find nothing until a new file appears in the ring — which is
+	// correct: there is nothing live left to tail.
+}
+
 // selectNext closes any open reader, clears currentPath/Stats, and opens the
 // first unvisited candidate. If that candidate turns out to be permanently
 // corrupt, openFile marks it visited and clears currentPath, so this loops
@@ -271,16 +351,27 @@ func (t *DumpcapTailer) selectNext(files []ringFile) {
 	}
 }
 
-// openFile attempts to open path as the active target.
-//   - Success: reader/currentPath/Stats all point at path.
+// openFile attempts to open path as the active target, starting from the top
+// of the file (offset 0 / just past the global header). See openFileAt for
+// the full success/incomplete-header/corrupt outcome contract.
+func (t *DumpcapTailer) openFile(path string) {
+	t.openFileAt(path, false)
+}
+
+// openFileAt attempts to open path as the active target.
+//   - Success: reader/currentPath/Stats all point at path. If atEnd is true
+//     the reader is additionally seeked to the file's current end (Finding
+//     F1's cold-start tail) so pre-existing content in that file is not
+//     replayed; otherwise reading starts from just past the global header.
 //   - errPcapHeaderIncomplete: the writer hasn't finished the header yet.
 //     currentPath/Stats are set to path (so pollOnce retries it next poll)
 //     but it is NOT marked visited — it must never be treated as corrupt.
+//     atEnd is irrelevant here since there is no reader yet to seek.
 //   - Any other error: permanently corrupt (or unsupported, e.g. pcapng).
 //     Marked visited so it is never selected again; currentPath/Stats are
 //     cleared rather than left pointing at a file with no open reader (never
 //     naming an already-closed/unopened file).
-func (t *DumpcapTailer) openFile(path string) {
+func (t *DumpcapTailer) openFileAt(path string, atEnd bool) {
 	if t.reader != nil {
 		t.reader.Close()
 		t.reader = nil
@@ -299,9 +390,18 @@ func (t *DumpcapTailer) openFile(path string) {
 		t.currentMu.Store("")
 		return
 	}
+	if atEnd {
+		if err := r.SeekToEnd(); err != nil {
+			log.Printf("⚠️ dumpcap tailer: cannot seek to end of %s: %v — starting from top instead", path, err)
+		}
+	}
 	t.reader = r
 	t.currentPath = path
 	t.currentMu.Store(path)
 	t.emptyDrains = 0
-	log.Printf("📂 dumpcap tailer: reading %s", path)
+	if atEnd {
+		log.Printf("📂 dumpcap tailer: cold start — tailing newest file %s live from its current end (ignoring any pre-existing ring contents)", path)
+	} else {
+		log.Printf("📂 dumpcap tailer: reading %s", path)
+	}
 }

@@ -669,6 +669,13 @@ func main() {
 	// the operator asked for real packets and Preflight already tells them exactly what's wrong
 	// (e.g. missing ChmodBPF), so there is nothing useful to fall back to.
 	if *useDumpcap && *launchDumpcap {
+		// F4: an empty -iface here means Preflight falls back to its weaker
+		// enumerate-only (-D) probe, which passes trivially, and dumpcap is
+		// then launched with `-i ""` — which fails and crash-loops forever
+		// under supervision instead of failing loudly once at startup.
+		if *iface == "" {
+			log.Fatalf("❌ -launch-dumpcap requires -iface <interface> (e.g. -iface en0)")
+		}
 		dumpcapManager = capture.NewDumpcapManager(capture.DumpcapManagerConfig{
 			Iface:      *iface,
 			OutputDir:  *dumpcapDir,
@@ -679,15 +686,23 @@ func main() {
 		if err := dumpcapManager.Start(); err != nil {
 			log.Fatalf("❌ dumpcap launch failed: %v", err)
 		}
-		defer dumpcapManager.Stop()
+		// Note: no `defer dumpcapManager.Stop()` here — every exit path below
+		// (log.Fatalf elsewhere, the signal handler's os.Exit(0)) bypasses
+		// deferred calls, so a defer here would never run. Shutdown is handled
+		// entirely by the signal handler below.
 
 		// http.ListenAndServe below blocks forever with no other exit path, so without this
 		// handler SIGINT/SIGTERM (Ctrl-C, systemd stop, deploy restart) would kill the process
-		// without ever running the defer above, orphaning the supervised dumpcap child.
+		// without ever stopping the supervised dumpcap child, orphaning it.
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		go func() {
 			<-sigCh
+			// F6: stop listening for further signals immediately so a second
+			// SIGINT during the ~6s Stop() shutdown window hits the default
+			// handler and force-quits, instead of being silently swallowed by
+			// this now-unread channel.
+			signal.Stop(sigCh)
 			log.Printf("🛑 shutting down: stopping dumpcap manager")
 			dumpcapManager.Stop()
 			os.Exit(0)

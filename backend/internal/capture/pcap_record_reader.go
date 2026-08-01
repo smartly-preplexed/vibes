@@ -67,6 +67,21 @@ func newPcapRecordReader(path string) (*pcapRecordReader, error) {
 
 func (r *pcapRecordReader) LinkType() layers.LinkType { return r.linkType }
 
+// SeekToEnd positions the reader at the file's current end, so a subsequent
+// Next() only returns records appended after this call — used for a
+// cold-start tail so pre-existing ring contents are never replayed. This is
+// safe even though records are variable-length: the file is only ever
+// appended to (dumpcap writes whole records), so "current end of file" is
+// always a record boundary, never mid-record.
+func (r *pcapRecordReader) SeekToEnd() error {
+	info, err := r.f.Stat()
+	if err != nil {
+		return err
+	}
+	r.offset = info.Size()
+	return nil
+}
+
 // Next returns the next complete record's frame bytes. ok=false means no
 // complete record is available yet (tail: retry later). err is fatal.
 func (r *pcapRecordReader) Next() ([]byte, bool, error) {
