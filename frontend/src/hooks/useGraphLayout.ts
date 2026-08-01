@@ -404,7 +404,11 @@ export function useGraphLayout(): GraphLayoutResult {
       if (tc) clusterWeight.set(tc, (clusterWeight.get(tc) ?? 0) + e.weight);
     });
     const allSubnets = new Set<string>();
-    layoutNodes.current.forEach(n => allSubnets.add(n.clusterKey));
+    const subnetPop = new Map<string, number>();
+    layoutNodes.current.forEach(n => {
+      allSubnets.add(n.clusterKey);
+      subnetPop.set(n.clusterKey, (subnetPop.get(n.clusterKey) ?? 0) + 1);
+    });
 
     allSubnets.forEach(key => {
       const slot = clusterSlots.current.get(key);
@@ -424,11 +428,15 @@ export function useGraphLayout(): GraphLayoutResult {
     const rings = hexRingsFor(orderedSubnets.length);
     const hexSize = Math.min(worldW, worldH) / (2 * (rings + 1.2));
 
+    // Stretch the (isotropic) hex field horizontally to fill a widescreen world,
+    // so a 16:9 monitor uses its left/right real-estate instead of leaving the
+    // territories in a tall centered column.
+    const aspectStretch = Math.min(1.9, Math.max(1, worldW / worldH));
     const clusterHome = new Map<string, { x: number; y: number }>();
     orderedSubnets.forEach((key, i) => {
       const cell = cells[i];
       const px = hexToPixel(cell.q, cell.r, hexSize);
-      const tx = centerX + px.x;
+      const tx = centerX + px.x * aspectStretch;
       const ty = centerY + px.y;
       // Smoothed home so a subnet gliding to a new hex (importance shift) flows.
       const t = clusterTargets.current.get(key) ?? { x: tx, y: ty };
@@ -438,15 +446,20 @@ export function useGraphLayout(): GraphLayoutResult {
       clusterHome.set(key, t);
     });
 
-    // Per-node home = subnet hex center + a deterministic spread within the hex,
-    // so a subnet's quiet nodes fill their territory instead of stacking.
-    const homeSpread = hexSize * 0.6;
+    // Per-node home = subnet hex center + a deterministic spread. Territory SIZE
+    // scales with subnet population (radius ∝ √count) so a 240-node subnet fans
+    // out across a big disk instead of piling into one hex, while a 2-node subnet
+    // stays compact. The √ radial term keeps areal density even (no center
+    // pileup). This is what actually uses the screen — the dominant subnets, the
+    // ones carrying most of the nodes, spread wide instead of clumping.
+    const territoryRadius = (key: string) =>
+      Math.max(hexSize * 0.3, minPairDist * Math.sqrt(subnetPop.get(key) ?? 1) * 0.55);
     layoutNodes.current.forEach(node => {
       const h = clusterHome.get(node.clusterKey);
       if (!h) return;
       const nh = hashStr(node.id);
       const ang = (nh % 360) * Math.PI / 180;
-      const rad = ((nh >> 9) % 100) / 100 * homeSpread;
+      const rad = Math.sqrt(((nh >> 9) % 100) / 100) * territoryRadius(node.clusterKey);
       node.homeX = h.x + Math.cos(ang) * rad;
       node.homeY = h.y + Math.sin(ang) * rad;
 
@@ -454,8 +467,10 @@ export function useGraphLayout(): GraphLayoutResult {
       // Connected nodes keep a real pull home so subnets hold their territory
       // and spread across the world; springs still bend them toward live peers,
       // forming bridges BETWEEN territories rather than one central clump.
-      // Quiet nodes settle firmly into their hex.
-      const homePull = connectedIds.has(node.id) ? 0.009 : 0.02;
+      // Quiet nodes settle firmly into their hex. The connected tether must be
+      // strong enough to resist cross-subnet springs collapsing everything to
+      // world-center (measured: nodes were piling into the middle 40%).
+      const homePull = connectedIds.has(node.id) ? 0.02 : 0.028;
       node.vx += (node.homeX - node.x) * homePull * dtNorm;
       node.vy += (node.homeY - node.y) * homePull * dtNorm;
     });
@@ -622,8 +637,13 @@ export function useGraphLayout(): GraphLayoutResult {
       // nodes together ACROSS territories so live conversations aggregate. Only
       // a slightly longer rest length and modestly softer response than
       // same-subnet, not the near-zero pull that used to lock nodes home.
-      const restLength = sameCluster ? tightRest : tightRest + 45;
-      const clusterResponse = sameCluster ? 1.25 : 0.9;
+      // Same-subnet: tight rest + strong response → talkers snap close together.
+      // Cross-subnet: a LONG, LOOSE tether (rest scales with hex spacing, response
+      // cut hard) so live conversations lean toward each other WITHOUT dragging
+      // whole territories into a central hairball. This contrast is what spreads
+      // clusters across the screen while keeping connected pairs visibly close.
+      const restLength = sameCluster ? tightRest : tightRest + Math.min(320, hexSize * 0.6);
+      const clusterResponse = sameCluster ? 1.05 : 0.4;
       const displacement = Math.max(-400, Math.min(400, dist - restLength));
       const spring = connectionPullStrength * 0.007 * clusterResponse * weightResponse * degreeResponse * displacement * dtNorm;
       const nx = dx / dist;
