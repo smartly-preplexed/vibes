@@ -159,7 +159,9 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       // Label connected nodes (the active conversations). Font is constant on
       // screen regardless of zoom; overlapping labels are always dropped, so
       // the overview shows a clean sparse set and detail fills in on zoom-in.
-      if (isConnected && node.id.includes('.') && vp.zoom >= labelZoomThreshold) {
+      // Cap labels per frame: canvas fillText/measureText is costly, and at
+      // wide spacing few labels overlap (so many would draw). Bound it.
+      if (labelBoxes.length < 140 && isConnected && node.id.includes('.') && vp.zoom >= labelZoomThreshold) {
         const fontSize = labelScreenPx / vp.zoom; // constant screen px
         ctx.font      = `${fontSize}px monospace`;
         ctx.textAlign = 'center';

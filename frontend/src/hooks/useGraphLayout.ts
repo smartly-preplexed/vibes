@@ -189,6 +189,7 @@ export function useGraphLayout(): GraphLayoutResult {
       (window as any).__VIBES_LAYOUT = { nodes: layoutNodes, edges: layoutEdges };
       (window as any).__VIBES_STORE = useNetworkStore;
       (window as any).__VIBES_SETTINGS = useSettingsStore;
+      (window as any).__VIBES_PHYSICS = usePhysicsStore;
     }
     const { width, height } = useSizeStore.getState();
     viewportRef.current = { width, height };
@@ -233,17 +234,45 @@ export function useGraphLayout(): GraphLayoutResult {
     // (decorate-sort) — doing it inside the comparator is a hot-loop killer at
     // firehose connection counts.
     const currentEdgeKeys = new Set(layoutEdges.current.map(e => e.id));
-    const candidateConns = storeConns
-      .filter(c =>
-        storeById.has(c.source) &&
-        storeById.has(c.target) &&
-        now - c.lastActive <= connectionLifetime
-      )
-      .map(c => ({ c, p: (c.weight ?? 1) + (currentEdgeKeys.has(c.id) ? 2 : 0) }))
-      .sort((a, b) => b.p - a.p || b.c.lastActive - a.c.lastActive)
-      .map(({ c }) => c);
-
     const maxTopologyEdges = Math.max(40, Math.floor(maxNodes * 2.4));
+
+    // The live connection store can hold tens of thousands of flows at firehose
+    // rates. Sorting/allocating over ALL of them every sync cost 10-16ms (a
+    // periodic render stall). Two cheap passes instead: pass 1 finds the
+    // priority cutoff for the top ~K via a fixed-size min-heap of NUMBERS (no
+    // per-connection allocation); pass 2 collects only conns at/above that
+    // cutoff (bounded) and sorts that small set.
+    const priorityOf = (c: typeof storeConns[number]) =>
+      (c.weight ?? 1) + (currentEdgeKeys.has(c.id) ? 2 : 0);
+    const K = maxTopologyEdges * 2;
+    const heap: number[] = []; // min-heap of the K largest priorities seen so far
+    for (const c of storeConns) {
+      if (now - c.lastActive > connectionLifetime) continue;
+      if (!storeById.has(c.source) || !storeById.has(c.target)) continue;
+      const p = priorityOf(c);
+      if (heap.length < K) {
+        heap.push(p);
+        let i = heap.length - 1;
+        while (i > 0) { const par = (i - 1) >> 1; if (heap[par] <= heap[i]) break; const tmp = heap[par]; heap[par] = heap[i]; heap[i] = tmp; i = par; }
+      } else if (p > heap[0]) {
+        heap[0] = p;
+        let i = 0; const hn = heap.length;
+        for (;;) { const l = 2 * i + 1, r = 2 * i + 2; let s = i; if (l < hn && heap[l] < heap[s]) s = l; if (r < hn && heap[r] < heap[s]) s = r; if (s === i) break; const tmp = heap[s]; heap[s] = heap[i]; heap[i] = tmp; i = s; }
+      }
+    }
+    const threshold = heap.length >= K ? heap[0] : -Infinity;
+    const candCap = K * 3;
+    const cand: Array<{ c: typeof storeConns[number]; p: number }> = [];
+    for (const c of storeConns) {
+      if (cand.length >= candCap) break;
+      if (now - c.lastActive > connectionLifetime) continue;
+      if (!storeById.has(c.source) || !storeById.has(c.target)) continue;
+      const p = priorityOf(c);
+      if (p >= threshold) cand.push({ c, p });
+    }
+    cand.sort((a, b) => b.p - a.p || b.c.lastActive - a.c.lastActive);
+    const candidateConns = cand.map(x => x.c);
+
     const nodeBudget = new Map<string, number>();
     const visibleConns: typeof candidateConns = [];
     for (const c of candidateConns) {
@@ -640,10 +669,18 @@ export function useGraphLayout(): GraphLayoutResult {
       // physics steps cheap at firehose connection counts.
       syncCountdown.current -= 1;
       if (syncCountdown.current <= 0) {
+        const t0 = performance.now();
         deltaSync();
+        if (import.meta.env.DEV) (window as any).__VIBES_PERF = { ...(window as any).__VIBES_PERF, syncMs: performance.now() - t0 };
         syncCountdown.current = 3;
       }
-      tickLayout(PHYSICS_STEP);
+      if (import.meta.env.DEV) {
+        const t1 = performance.now();
+        tickLayout(PHYSICS_STEP);
+        (window as any).__VIBES_PERF = { ...(window as any).__VIBES_PERF, tickMs: performance.now() - t1 };
+      } else {
+        tickLayout(PHYSICS_STEP);
+      }
       accumulator.current -= PHYSICS_STEP;
     }
   }, [deltaSync, tickLayout]);
