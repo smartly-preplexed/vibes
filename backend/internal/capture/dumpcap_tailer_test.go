@@ -349,6 +349,16 @@ func TestTailerRetriesIncompleteHeaderUntilComplete(t *testing.T) {
 // in the ring's only file before the tailer starts. The tailer must not
 // deliver those N stale packets — only packets appended after cold start
 // (live traffic) should arrive.
+//
+// This must be discriminating against a start-at-oldest regression, not just
+// against a total-silence one: collectPackets(ch, n, timeout) returns as
+// soon as n packets arrive, so a naive "assert we got exactly N" check would
+// pass even under the old buggy code — it would just collect the first N of
+// the pre-existing stale packets and never notice they weren't the live
+// ones. To catch that, this asserts BOTH that the live count arrives AND
+// that a follow-up read comes back empty (no leftover stale packets queued
+// behind them) — mirroring the already-discriminating sibling test
+// TestTailerColdStartTailsOnlyNewestOfMultipleExistingFiles.
 func TestTailerColdStartSkipsPreExistingRingContents(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vibes_en0_00001_20260731150000.pcap")
@@ -356,20 +366,30 @@ func TestTailerColdStartSkipsPreExistingRingContents(t *testing.T) {
 	defer f.Close()
 	w := pcapgo.NewWriter(f)
 	w.WriteFileHeader(65536, layers.LinkTypeEthernet)
-	appendTestPackets(t, f, w, 50) // pre-existing "stale" packets, written before Start()
+	appendTestPackets(t, f, w, 60) // pre-existing "stale" packets, written before Start()
 
 	tl := newTestTailer(dir)
 	if err := tl.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer tl.Stop()
-	time.Sleep(coldStartSettle) // let cold start land at EOF (past the 50 stale packets)
+	time.Sleep(coldStartSettle) // let cold start land at EOF (past the 60 stale packets)
 
-	appendTestPackets(t, f, w, 10) // live packets written after cold start
+	appendTestPackets(t, f, w, 15) // distinct run of live packets written after cold start
 
-	got := collectPackets(tl.GetPacketChannel(), 10, 2*time.Second)
-	if len(got) != 10 {
-		t.Fatalf("got %d packets, want 10 (only the live ones — must not replay the 50 pre-existing)", len(got))
+	got := collectPackets(tl.GetPacketChannel(), 15, 2*time.Second)
+	if len(got) != 15 {
+		t.Fatalf("got %d packets, want 15 (only the live ones — must not replay the 60 pre-existing)", len(got))
+	}
+
+	// The discriminating check: under start-at-oldest, the channel would
+	// still have (60 - 15) = 45 leftover stale packets queued behind the 15
+	// just collected, so this follow-up read would return more. Under the
+	// fix, the tailer never queued any of the 60 stale packets in the first
+	// place, so this must come back empty.
+	more := collectPackets(tl.GetPacketChannel(), 1, 500*time.Millisecond)
+	if len(more) != 0 {
+		t.Fatalf("got %d unexpected extra packet(s) after the 15 live ones — the 60 pre-existing packets were replayed (start-at-oldest regression)", len(more))
 	}
 }
 
