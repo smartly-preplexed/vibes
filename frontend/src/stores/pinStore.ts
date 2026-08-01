@@ -1,25 +1,105 @@
 import { create } from 'zustand';
 import { persist, PersistStorage } from 'zustand/middleware';
-import { Address4 } from 'ip-address';
 
-// Helper function to check if a value is a valid CIDR notation.
-function isCIDR(value: string): boolean {
-  try {
-    const address = new Address4(value);
-    return address.subnetMask > 0;
-  } catch (error) {
-    return false;
+// ---------------------------------------------------------------------------
+// Compiled matcher (module-level, shared across all isPined calls).
+//
+// isPined() runs in the physics/render hot path — once per node AND once per
+// edge endpoint, every frame. The old implementation allocated two Address4
+// objects and did BigInt subnet math on every call, so pinning a /24 with
+// hundreds of nodes and thousands of edges melted the render loop.
+//
+// Instead we compile the rule set ONCE into plain uint32 masks/ranges and an
+// exact-match Set, then match with branch-cheap integer ops and memoize the
+// result per IP. Warm path is a single Map lookup; cold path is a handful of
+// integer comparisons. No allocations, no BigInt.
+// ---------------------------------------------------------------------------
+
+let ruleVersion = 0;        // bumped on every rule mutation / rehydrate
+let compiledVersion = -1;   // version the compiled state below reflects
+let exactSet = new Set<string>();
+let cidrs: { net: number; mask: number }[] = [];
+let ranges: { start: number; end: number }[] = [];
+let memo = new Map<string, boolean>();
+
+// Parse a dotted-quad to a uint32, or null if malformed.
+function ipToUint(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (let i = 0; i < 4; i++) {
+    const octet = Number(parts[i]);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+    n = n * 256 + octet;
   }
+  return n >>> 0;
 }
 
-// Helper function to check if a value is an IP range.
-function isIPRange(value: string): boolean {
-  return /^\d{1,3}(\.\d{1,3}){3}-\d{1,3}$/.test(value);
+function compile(rules: Set<string>) {
+  const nextExact = new Set<string>();
+  const nextCidrs: { net: number; mask: number }[] = [];
+  const nextRanges: { start: number; end: number }[] = [];
+
+  for (const rule of rules) {
+    const slash = rule.indexOf('/');
+    if (slash > 0) {
+      // CIDR: a.b.c.d/bits
+      const base = ipToUint(rule.slice(0, slash));
+      const bits = Number(rule.slice(slash + 1));
+      if (base !== null && Number.isInteger(bits) && bits >= 0 && bits <= 32) {
+        const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+        nextCidrs.push({ net: (base & mask) >>> 0, mask });
+        continue;
+      }
+    }
+
+    const dash = rule.indexOf('-');
+    if (dash > 0 && slash < 0) {
+      // Range: a.b.c.d-e (last octet range)
+      const startStr = rule.slice(0, dash);
+      const endOctet = Number(rule.slice(dash + 1));
+      const startN = ipToUint(startStr);
+      const lastDot = startStr.lastIndexOf('.');
+      if (startN !== null && lastDot > 0 && Number.isInteger(endOctet) && endOctet >= 0 && endOctet <= 255) {
+        const endN = ipToUint(startStr.slice(0, lastDot + 1) + endOctet);
+        if (endN !== null) {
+          nextRanges.push({ start: Math.min(startN, endN), end: Math.max(startN, endN) });
+          continue;
+        }
+      }
+    }
+
+    // Fallback: exact IP (or anything we couldn't parse — matched literally).
+    nextExact.add(rule);
+  }
+
+  exactSet = nextExact;
+  cidrs = nextCidrs;
+  ranges = nextRanges;
+  memo = new Map();
+  compiledVersion = ruleVersion;
 }
 
-// Helper function to convert an IP address to a BigInt for comparison.
-function ipToBigInt(ip: string): bigint {
-    return ip.split('.').reduce((acc, octet) => (acc << BigInt(8)) + BigInt(parseInt(octet, 10)), BigInt(0));
+function matches(ip: string): boolean {
+  if (exactSet.has(ip)) return true;
+  const n = ipToUint(ip);
+  if (n === null) return false;
+  for (let i = 0; i < cidrs.length; i++) {
+    if (((n & cidrs[i].mask) >>> 0) === cidrs[i].net) return true;
+  }
+  for (let i = 0; i < ranges.length; i++) {
+    if (n >= ranges[i].start && n <= ranges[i].end) return true;
+  }
+  return false;
+}
+
+// Helper retained for external callers that validate CIDR input.
+export function isCIDR(value: string): boolean {
+  const slash = value.indexOf('/');
+  if (slash <= 0) return false;
+  const base = ipToUint(value.slice(0, slash));
+  const bits = Number(value.slice(slash + 1));
+  return base !== null && Number.isInteger(bits) && bits > 0 && bits <= 32;
 }
 
 interface PinState {
@@ -59,6 +139,7 @@ export const usePinStore = create<PinState>()(
     (set, get) => ({
       pinningRules: new Set(),
       addPinningRule: (rule) => {
+        ruleVersion++;
         set((state) => {
           const newRules = new Set(state.pinningRules);
           newRules.add(rule);
@@ -66,6 +147,7 @@ export const usePinStore = create<PinState>()(
         });
       },
       removePinningRule: (rule) => {
+        ruleVersion++;
         set((state) => {
           const newRules = new Set(state.pinningRules);
           newRules.delete(rule);
@@ -73,43 +155,26 @@ export const usePinStore = create<PinState>()(
         });
       },
       clearAllPins: () => {
+        ruleVersion++;
         set({ pinningRules: new Set() });
       },
       isPined: (ip) => {
-        const { pinningRules } = get();
-        
-        for (const rule of pinningRules) {
-          if (isCIDR(rule)) {
-            try {
-              const subnet = new Address4(rule);
-              if (new Address4(ip).isInSubnet(subnet)) {
-                return true;
-              }
-            } catch (e) {
-              // Invalid IP or CIDR, ignore.
-            }
-          } else if (isIPRange(rule)) {
-            const [startIP, endOctet] = rule.split('-');
-            const baseIP = startIP.substring(0, startIP.lastIndexOf('.'));
-            const startOctet = parseInt(startIP.substring(startIP.lastIndexOf('.') + 1), 10);
-            
-            const ipBigInt = ipToBigInt(ip);
-            const startRangeBigInt = ipToBigInt(`${baseIP}.${startOctet}`);
-            const endRangeBigInt = ipToBigInt(`${baseIP}.${endOctet}`);
-
-            if (ipBigInt >= startRangeBigInt && ipBigInt <= endRangeBigInt) {
-              return true;
-            }
-          } else if (rule === ip) {
-            return true;
-          }
-        }
-        return false;
-      }
+        if (compiledVersion !== ruleVersion) compile(get().pinningRules);
+        const cached = memo.get(ip);
+        if (cached !== undefined) return cached;
+        const result = matches(ip);
+        memo.set(ip, result);
+        return result;
+      },
     }),
     {
       name: 'pin-storage',
       storage: storage,
+      // Rehydration replaces pinningRules without going through the setters,
+      // so force a recompile on the next isPined call.
+      onRehydrateStorage: () => () => {
+        ruleVersion++;
+      },
     }
   )
 );
