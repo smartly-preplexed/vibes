@@ -24,10 +24,25 @@ const IPDebugPage = lazy(() => import('./components/IPDebugPage').then(module =>
 import { CommandBar } from './components/CommandBar';
 
 // Status bar component with active panel
+const CAPTURE_SOURCE_LABELS: Record<string, string> = {
+  dumpcap: '🚀 DUMPCAP',
+  real: '📡 LIVE',
+  simulated: '🎮 SIM',
+  zeek: '🦅 ZEEK',
+  pcap_replay: '🎞️ PCAP',
+};
+
 const StatusBar = memo(({ status, error }: { status: string; error: string | null }) => {
   const { nodes, connections } = useNetworkStore();
   const { packets } = usePacketStore();
-  
+
+  // Capture source badge, derived from the actual packets flowing (the honest
+  // signal — reflects what the backend is really serving, not the UI's guess).
+  const latestSource = packets.length ? packets[packets.length - 1].source : undefined;
+  const sourceLabel = latestSource
+    ? (CAPTURE_SOURCE_LABELS[latestSource] ?? latestSource.toUpperCase())
+    : '— NO DATA';
+
   return (
     <div className="status-bar" style={{ zIndex: 999, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
@@ -45,6 +60,14 @@ const StatusBar = memo(({ status, error }: { status: string; error: string | nul
         fontSize: '14px',
         color: 'var(--vibes-primary, #00ff00)'
       }}>
+        <span style={{
+          fontWeight: 'bold',
+          padding: '2px 8px',
+          borderRadius: '3px',
+          border: '1px solid var(--vibes-primary, #00ff00)',
+          background: 'rgba(var(--vibes-primary-rgb, 0, 255, 0), 0.15)',
+          letterSpacing: '1px',
+        }}>{sourceLabel}</span>
         <span>📦 Packets: <strong style={{ color: '#fff' }}>{packets.length}</strong></span>
         <span>🔘 Nodes: <strong style={{ color: '#fff' }}>{nodes.length}</strong></span>
         <span>🔗 Connections: <strong style={{ color: '#fff' }}>{connections.length}</strong></span>

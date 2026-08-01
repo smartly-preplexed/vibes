@@ -78,8 +78,61 @@ func (r *pcapRecordReader) SeekToEnd() error {
 	if err != nil {
 		return err
 	}
-	r.offset = info.Size()
-	return nil
+	size := info.Size()
+	// Raw file size is NOT reliably a record boundary: dumpcap, writing live at
+	// high rate, can leave a partial record (or a partial 16-byte header) at the
+	// frontier. Landing there mid-record makes the next read interpret payload
+	// bytes as a record header → a garbage length → fatal "corrupt record".
+	// Instead, walk complete records forward from the (header-aligned) current
+	// offset to the last boundary at/before EOF. Only record headers are parsed,
+	// in 1 MB buffered blocks, so this is fast even on a multi-GB file and it
+	// delivers nothing (cold start still ignores pre-existing history).
+	const blockSize = 1 << 20
+	block := make([]byte, blockSize)
+	for {
+		if r.offset+pcapRecordHeader > size {
+			return nil // no room for another header → frontier reached
+		}
+		toRead := size - r.offset
+		if toRead > blockSize {
+			toRead = blockSize
+		}
+		n, rerr := r.f.ReadAt(block[:toRead], r.offset)
+		if n < pcapRecordHeader {
+			if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+				return rerr
+			}
+			return nil
+		}
+		p := 0
+		for p+pcapRecordHeader <= n {
+			inclLen := int64(r.byteOrder.Uint32(block[p+8 : p+12]))
+			if inclLen < 0 || inclLen > maxSanePacketLen {
+				r.offset += int64(p)
+				return nil // garbage length → partial/mid-write frontier
+			}
+			recEnd := int64(p) + pcapRecordHeader + inclLen
+			if r.offset+recEnd > size {
+				r.offset += int64(p)
+				return nil // record not fully written yet → frontier
+			}
+			if recEnd > int64(n) {
+				break // record spans past this block; refill from p
+			}
+			p = int(recEnd)
+		}
+		if p == 0 {
+			// A single record larger than the block buffer (jumbo). Advance by it
+			// directly; bounds already validated above for the header case.
+			inclLen := int64(r.byteOrder.Uint32(block[8:12]))
+			if inclLen < 0 || inclLen > maxSanePacketLen || r.offset+pcapRecordHeader+inclLen > size {
+				return nil
+			}
+			r.offset += pcapRecordHeader + inclLen
+			continue
+		}
+		r.offset += int64(p)
+	}
 }
 
 // Next returns the next complete record's frame bytes. ok=false means no

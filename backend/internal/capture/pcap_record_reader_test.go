@@ -176,6 +176,55 @@ func TestRecordReaderSeekToEndSkipsExistingRecords(t *testing.T) {
 	}
 }
 
+// TestRecordReaderSeekToEndPartialFrontier reproduces the live-capture bug:
+// dumpcap is mid-write, so the file ends with a TORN record (partial payload).
+// Raw-size SeekToEnd would land mid-record and misread a garbage length; the
+// boundary-scanning SeekToEnd must land on the last complete record instead,
+// then deliver records appended after the torn one is completed.
+func TestRecordReaderSeekToEndPartialFrontier(t *testing.T) {
+	dir := t.TempDir()
+	// 4 complete records, then a torn trailing record (header + only half its payload).
+	full := writeTestPcap(t, dir, "full.pcap", 5)
+	raw, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Find where the 5th record starts by re-deriving: easier to just truncate a
+	// few bytes off the end so the last record is torn mid-payload.
+	torn := filepath.Join(dir, "torn.pcap")
+	if err := os.WriteFile(torn, raw[:len(raw)-12], 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := newPcapRecordReader(torn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.SeekToEnd(); err != nil {
+		t.Fatalf("SeekToEnd on torn-frontier file must not error, got %v", err)
+	}
+	// At the frontier boundary there must be no fatal error and no record yet.
+	if _, ok, err := r.Next(); err != nil || ok {
+		t.Fatalf("expected clean frontier after SeekToEnd, got ok=%v err=%v", ok, err)
+	}
+
+	// Complete the torn record, then append 2 fresh ones; all 3 (completed torn
+	// + 2 new) must be delivered, none of the earlier complete records replayed.
+	f, err := os.OpenFile(torn, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write(raw[len(raw)-12:]) // finish the torn record
+	w := pcapgo.NewWriter(f)
+	appendTestPackets(t, f, w, 2)
+	f.Close()
+
+	if got := drainAll(t, r); got != 3 {
+		t.Fatalf("torn-frontier: got %d, want 3 (completed torn record + 2 appended)", got)
+	}
+}
+
 func TestRecordReaderIncompleteHeader(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "short.pcap")
