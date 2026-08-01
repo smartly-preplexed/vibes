@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import { useSizeStore } from '../stores/sizeStore';
-import { useGraphLayout, WORLD_SCALE } from '../hooks/useGraphLayout';
+import { useGraphLayout, WORLD_SCALE, camera } from '../hooks/useGraphLayout';
 import { useThemeStore, subnetNodeColor, edgeColor, Theme } from '../stores/themeStore';
 
 // Start zoomed out so the whole (larger-than-viewport) world fits, leaving real
@@ -10,7 +10,9 @@ const FIT_ZOOM = 1 / WORLD_SCALE;
 export const CanvasNetworkRenderer: React.FC = React.memo(() => {
   const canvasRef    = useRef<HTMLCanvasElement>(null);
   const animationRef = useRef<number>();
-  const viewportRef  = useRef({ x: 0, y: 0, zoom: FIT_ZOOM, width: 0, height: 0 });
+  // Pan/zoom/viewport live in the shared module `camera` so the layout can read
+  // them to dock pinned nodes in fixed screen space.
+  const viewportRef  = useRef(camera);
   const frameCount   = useRef(0);
   const lastFpsTime  = useRef(0);
   const fpsRef       = useRef(0);

@@ -51,6 +51,12 @@ const CLUSTER_RADIUS = 110;
 // zoom past 1.0 into the detail.
 export const WORLD_SCALE = 1.8;
 
+// Shared canvas camera (pan/zoom + viewport size). A plain module object — not a
+// store — so it updates every mouse event / frame with zero React re-renders.
+// The renderer owns and mutates it; the layout reads it to dock pinned nodes in
+// fixed SCREEN space (screen→world = screenPos / zoom + pan).
+export const camera = { x: 0, y: 0, zoom: 1 / WORLD_SCALE, width: 0, height: 0 };
+
 // Hex cells in ring order (center first, then expanding rings). Subnets are
 // assigned to these cells by importance, so the busiest subnet sits in the
 // center hex and quieter ones fan outward — "most important right in front".
@@ -190,6 +196,7 @@ export function useGraphLayout(): GraphLayoutResult {
       (window as any).__VIBES_STORE = useNetworkStore;
       (window as any).__VIBES_SETTINGS = useSettingsStore;
       (window as any).__VIBES_PHYSICS = usePhysicsStore;
+      (window as any).__VIBES_CAMERA = camera;
     }
     const { width, height } = useSizeStore.getState();
     viewportRef.current = { width, height };
@@ -475,13 +482,41 @@ export function useGraphLayout(): GraphLayoutResult {
       node.vy += (node.homeY - node.y) * homePull * dtNorm;
     });
 
+    // Pinned nodes dock in a fixed SCREEN-space frame: straight down the right
+    // edge (starting below the top-right debug panel), then wrapping right→left
+    // across the bottom. Positions are computed in screen px and converted to
+    // world coords through the live camera, so the dock stays glued to the same
+    // screen spot under any pan or zoom (never falls into the middle).
     const pinnedList = Array.from(layoutNodes.current.values())
       .filter(n => isPined(n.id))
       .sort((a, b) => a.id.localeCompare(b.id));
+    const screenW = vp.width || 1280;
+    const screenH = vp.height || 800;
+    const dockRightX = screenW - 55;   // right column, just inside the edge
+    const dockTopY = 300;              // clear the debug panel in the top-right
+    const dockBottomY = screenH - 45;  // bottom row
+    const vStep = 46;                  // vertical gap down the right column
+    const hStep = 135;                 // horizontal gap across the bottom rows
+    const leftMargin = 60;             // don't let the bottom rows run off-screen
+    const rightColCount = Math.max(1, Math.floor((dockBottomY - dockTopY) / vStep));
+    const bottomCols = Math.max(1, Math.floor((dockRightX - leftMargin) / hStep));
     pinnedList.forEach((node, i) => {
-      const col = Math.floor(i / 18);
-      node.x = (vp.width || 1280) - 100 - col * 200;
-      node.y = 100 + (i % 18) * 50;
+      let sx: number, sy: number;
+      if (i < rightColCount) {
+        sx = dockRightX;                       // down the right edge
+        sy = dockTopY + i * vStep;
+      } else {
+        // Then across the bottom, right → left; overflow stacks into rows that
+        // climb upward, keeping the whole dock in the bottom-right frame even
+        // when a full /24 is pinned.
+        const j = i - rightColCount;
+        const row = Math.floor(j / bottomCols);   // 0 = bottom row, stacks up
+        const colInRow = j % bottomCols;          // 0 = rightmost, goes left
+        sx = dockRightX - colInRow * hStep;
+        sy = dockBottomY - row * vStep;
+      }
+      node.x = sx / camera.zoom + camera.x;
+      node.y = sy / camera.zoom + camera.y;
       node.vx = 0;
       node.vy = 0;
     });
