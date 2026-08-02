@@ -83,19 +83,24 @@ export const usePacketStore = create<PacketState>((set, get) => ({
       newPackets.push(packet);
     });
     
-    // Add all packets at once
-    let updatedPackets = [...state.packets, ...newPackets];
-    
-    // Check if we're approaching memory limits
-    if (updatedPackets.length > PACKET_TRIM_THRESHOLD) {
-      // Aggressive trim - keep only recent packets
-      console.warn(`Packet count (${updatedPackets.length}) exceeding threshold, aggressively pruning`);
-      updatedPackets = updatedPackets.slice(-Math.floor(MAX_PACKET_HISTORY/2));
-    } else if (updatedPackets.length > MAX_PACKET_HISTORY) {
-      updatedPackets = updatedPackets.slice(-MAX_PACKET_HISTORY);
+    // Optimize array allocation by pre-pruning before concatenation
+    const targetCount = state.packets.length + newPackets.length;
+    let basePackets = state.packets;
+
+    if (targetCount > PACKET_TRIM_THRESHOLD) {
+      const retainCount = Math.floor(MAX_PACKET_HISTORY / 2);
+      if (newPackets.length >= retainCount) {
+        return { packets: newPackets.slice(-retainCount) };
+      }
+      basePackets = state.packets.slice(-(retainCount - newPackets.length));
+    } else if (targetCount > MAX_PACKET_HISTORY) {
+      if (newPackets.length >= MAX_PACKET_HISTORY) {
+        return { packets: newPackets.slice(-MAX_PACKET_HISTORY) };
+      }
+      basePackets = state.packets.slice(-(MAX_PACKET_HISTORY - newPackets.length));
     }
-    
-    return { packets: updatedPackets };
+
+    return { packets: [...basePackets, ...newPackets] };
   }),
   
   clearPackets: () => {

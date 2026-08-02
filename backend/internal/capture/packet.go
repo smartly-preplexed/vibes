@@ -121,7 +121,7 @@ type SimulatedCapture struct {
 func NewSimulatedCapture() *SimulatedCapture {
 	return &SimulatedCapture{
 		packetChan: make(chan *Packet, 1000), // Increased buffer for busy network simulation
-		stopChan:   make(chan bool),
+		stopChan:   make(chan bool, 1),
 		running:    false,
 	}
 }
@@ -144,7 +144,10 @@ func (s *SimulatedCapture) Stop() error {
 	}
 
 	s.running = false
-	s.stopChan <- true
+	select {
+	case s.stopChan <- true:
+	default:
+	}
 	return nil
 }
 
@@ -425,10 +428,7 @@ func (s *SimulatedCapture) generatePackets() {
 			// Random bidirectional traffic (40% chance of response)
 			if rand.Float32() < 0.4 {
 				responseSize := 64 + rand.Intn(800) // Smaller responses
-				go func() {
-					time.Sleep(time.Duration(1+rand.Intn(10)) * time.Millisecond) // 1-10ms delay
-					s.sendPacket(servers[serverIndex], localNetwork[clientIndex], responseSize, protocol)
-				}()
+				s.sendPacket(servers[serverIndex], localNetwork[clientIndex], responseSize, protocol)
 			}
 
 		// Fast traffic - gateway/internet traffic
@@ -524,6 +524,9 @@ func (s *SimulatedCapture) generatePackets() {
 
 // sendPacket creates and sends a packet
 func (s *SimulatedCapture) sendPacket(src, dst string, size int, protocol string) {
+	if !s.running {
+		return
+	}
 	// Generate realistic ports based on protocol
 	srcPort, dstPort := generateRealisticPorts(protocol)
 
@@ -561,6 +564,9 @@ func (s *SimulatedCapture) simulateDataBurst(external, gateway, server string) {
 	// Server responds with burst of data packets (5-15 packets)
 	burstSize := 5 + rand.Intn(10)
 	for i := 0; i < burstSize; i++ {
+		if !s.running {
+			return
+		}
 		packetSize := 800 + rand.Intn(700) // 800-1500 bytes
 		s.sendPacket(server, gateway, packetSize, ProtocolTCP)
 		time.Sleep(time.Duration(3+rand.Intn(10)) * time.Millisecond) // 3-13ms between packets
@@ -570,6 +576,9 @@ func (s *SimulatedCapture) simulateDataBurst(external, gateway, server string) {
 
 	// Gateway forwards responses back to external
 	for i := 0; i < burstSize/2; i++ {
+		if !s.running {
+			return
+		}
 		responseSize := 1200 + rand.Intn(300) // 1200-1500 bytes
 		s.sendPacket(gateway, external, responseSize, ProtocolTCP)
 		time.Sleep(time.Duration(5+rand.Intn(15)) * time.Millisecond) // 5-20ms
@@ -598,15 +607,15 @@ func (s *SimulatedCapture) simulateLocalDataBurst(src, dst string) {
 	// Data transfer burst (10-30 packets)
 	burstSize := 10 + rand.Intn(20)
 	for i := 0; i < burstSize; i++ {
+		if !s.running {
+			return
+		}
 		packetSize := 500 + rand.Intn(1000) // 500-1500 bytes
 		s.sendPacket(src, dst, packetSize, ProtocolTCP)
 
 		// Random acknowledgments (30% chance)
 		if rand.Float32() < 0.3 {
-			go func() {
-				time.Sleep(time.Duration(2+rand.Intn(8)) * time.Millisecond)
-				s.sendPacket(dst, src, 64+rand.Intn(100), ProtocolTCP) // Small ACK
-			}()
+			s.sendPacket(dst, src, 64+rand.Intn(100), ProtocolTCP) // Small ACK
 		}
 
 		time.Sleep(time.Duration(2+rand.Intn(8)) * time.Millisecond) // 2-10ms between packets
@@ -626,7 +635,7 @@ type RealCapture struct {
 func NewRealCapture(iface string) *RealCapture {
 	return &RealCapture{
 		packetChan: make(chan *Packet, 10000), // Massive buffer for high-throughput real capture
-		stopChan:   make(chan bool),
+		stopChan:   make(chan bool, 1),
 		running:    false,
 		iface:      iface,
 	}
@@ -661,7 +670,7 @@ func (r *RealCapture) Start() error {
 		log.Printf("Error setting promiscuous mode: %v", err)
 		return err
 	}
-	if err = inactiveHandle.SetTimeout(pcap.BlockForever); err != nil {
+	if err = inactiveHandle.SetTimeout(1 * time.Second); err != nil {
 		log.Printf("Error setting timeout: %v", err)
 		return err
 	}
@@ -695,9 +704,12 @@ func (r *RealCapture) Stop() error {
 	}
 
 	r.running = false
-	r.stopChan <- true
 	if r.handle != nil {
 		r.handle.Close()
+	}
+	select {
+	case r.stopChan <- true:
+	default:
 	}
 	return nil
 }
@@ -724,6 +736,9 @@ func (r *RealCapture) capturePackets() {
 		default:
 			packet, err := packetSource.NextPacket()
 			if err != nil {
+				if !r.running {
+					return
+				}
 				log.Printf("Error reading packet: %v", err)
 				continue
 			}
@@ -840,7 +855,7 @@ type PCAPReplayConfig struct {
 func NewPCAPReplayCapture(config PCAPReplayConfig) *PCAPReplayCapture {
 	replay := &PCAPReplayCapture{
 		packetChan:   make(chan *Packet, 1000),
-		stopChan:     make(chan bool),
+		stopChan:     make(chan bool, 1),
 		running:      false,
 		pcapFile:     config.FilePath,
 		replaySpeed:  config.ReplaySpeed,
@@ -897,7 +912,10 @@ func (p *PCAPReplayCapture) Stop() error {
 	}
 
 	p.running = false
-	p.stopChan <- true
+	select {
+	case p.stopChan <- true:
+	default:
+	}
 	return nil
 }
 
@@ -1110,7 +1128,7 @@ type TimeWindowConfig struct {
 func NewTimeWindowProcessor(config TimeWindowConfig) *TimeWindowProcessor {
 	return &TimeWindowProcessor{
 		packetChan:     make(chan *Packet, 1000),
-		stopChan:       make(chan bool),
+		stopChan:       make(chan bool, 1),
 		transitionChan: make(chan string, 10),
 		seekChan:       make(chan time.Time, 10),
 		running:        false,
@@ -1158,10 +1176,12 @@ func (twp *TimeWindowProcessor) Stop() error {
 	}
 
 	twp.running = false
-	twp.stopChan <- true
-
 	if twp.currentFile != nil {
 		twp.currentFile.Close()
+	}
+	select {
+	case twp.stopChan <- true:
+	default:
 	}
 
 	return nil
@@ -1506,7 +1526,7 @@ type DumpcapCapture struct {
 func NewDumpcapCapture(dumpcapDir string, iface string) *DumpcapCapture {
 	return &DumpcapCapture{
 		packetChan: make(chan *Packet, 1000), // Larger buffer for high-throughput
-		stopChan:   make(chan bool),
+		stopChan:   make(chan bool, 1),
 		running:    false,
 		dumpcapDir: dumpcapDir,
 		iface:      iface,
@@ -1538,13 +1558,15 @@ func (d *DumpcapCapture) Stop() error {
 	}
 
 	d.running = false
-	d.stopChan <- true
-
 	if d.pcapHandle != nil {
 		d.pcapHandle.Close()
 	}
 	if d.fileWatcher != nil {
 		d.fileWatcher.Close()
+	}
+	select {
+	case d.stopChan <- true:
+	default:
 	}
 
 	log.Printf("Stopped dumpcap file monitoring")

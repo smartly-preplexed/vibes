@@ -11,10 +11,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"context"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/c-robinson/iplib"
@@ -62,9 +65,23 @@ type ClientManager struct {
 	unregister         chan *Client
 	pinningRules       []string
 	rulesMutex         sync.RWMutex
+	stateMutex         sync.RWMutex
 	timeWindowProcessor *capture.TimeWindowProcessor
 	currentCaptureMode  string
 	originalCapture     capture.PacketCapture
+}
+
+func (manager *ClientManager) getActiveCaptureChannel() (<-chan *capture.Packet, string) {
+	manager.stateMutex.RLock()
+	defer manager.stateMutex.RUnlock()
+
+	if manager.timeWindowProcessor != nil && manager.currentCaptureMode == "time_window" {
+		return manager.timeWindowProcessor.GetPacketChannel(), "time_window"
+	}
+	if manager.originalCapture != nil {
+		return manager.originalCapture.GetPacketChannel(), manager.currentCaptureMode
+	}
+	return nil, ""
 }
 
 func NewClientManager() *ClientManager {
@@ -283,8 +300,10 @@ func (manager *ClientManager) HandleWebSocket(w http.ResponseWriter, r *http.Req
 	manager.register <- client
 	
 	// Store original capture for live mode switching
+	manager.stateMutex.Lock()
 	manager.originalCapture = captureSystem
 	manager.currentCaptureMode = captureMode
+	manager.stateMutex.Unlock()
 
 	// Send mode information to the client
 	var modeMessage []byte
@@ -332,26 +351,17 @@ func (manager *ClientManager) HandleWebSocket(w http.ResponseWriter, r *http.Req
 			var packet *capture.Packet
 			var packetReceived bool
 			
-			// Check if we're in time window mode
-			if manager.timeWindowProcessor != nil && manager.currentCaptureMode == "time_window" {
-				select {
-				case packet = <-manager.timeWindowProcessor.GetPacketChannel():
-					packetReceived = true
-				case <-client.stopForwarder:
-					return
-				case <-time.After(1 * time.Millisecond):
-					// No packet available from time window, continue
-				}
-			} else {
-				// Normal live capture mode
-				select {
-				case packet = <-captureSystem.GetPacketChannel():
-					packetReceived = true
-				case <-client.stopForwarder:
-					return
-				case <-time.After(1 * time.Millisecond):
-					// No packet available, continue
-				}
+			packetChan, _ := manager.getActiveCaptureChannel()
+			if packetChan == nil {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+
+			select {
+			case packet = <-packetChan:
+				packetReceived = true
+			case <-client.stopForwarder:
+				return
 			}
 			
 			if packetReceived && packet != nil {
@@ -515,6 +525,7 @@ func (manager *ClientManager) handleTimeWindowCommand(msg map[string]interface{}
 	}
 	processor := capture.NewTimeWindowProcessor(config)
 	
+	manager.stateMutex.Lock()
 	// Stop current capture if running
 	if manager.originalCapture != nil {
 		manager.originalCapture.Stop()
@@ -522,6 +533,7 @@ func (manager *ClientManager) handleTimeWindowCommand(msg map[string]interface{}
 	
 	// Start time window playback
 	if err := processor.Start(); err != nil {
+		manager.stateMutex.Unlock()
 		log.Printf("Failed to start time window playback: %v", err)
 		response, _ := json.Marshal(map[string]interface{}{
 			"type": "time_window_error",
@@ -533,6 +545,7 @@ func (manager *ClientManager) handleTimeWindowCommand(msg map[string]interface{}
 	
 	manager.timeWindowProcessor = processor
 	manager.currentCaptureMode = "time_window"
+	manager.stateMutex.Unlock()
 	
 	// Send success response
 	response, _ := json.Marshal(map[string]interface{}{
@@ -549,6 +562,7 @@ func (manager *ClientManager) handleTimeWindowCommand(msg map[string]interface{}
 func (manager *ClientManager) handleSwitchToLive(client *Client) {
 	log.Printf("🔄 Switching back to live mode...")
 	
+	manager.stateMutex.Lock()
 	// Stop time window processor
 	if manager.timeWindowProcessor != nil {
 		manager.timeWindowProcessor.Stop()
@@ -558,6 +572,7 @@ func (manager *ClientManager) handleSwitchToLive(client *Client) {
 	// Restart original capture
 	if manager.originalCapture != nil {
 		if err := manager.originalCapture.Start(); err != nil {
+			manager.stateMutex.Unlock()
 			log.Printf("Failed to restart live capture: %v", err)
 			response, _ := json.Marshal(map[string]interface{}{
 				"type": "switch_to_live_error",
@@ -569,6 +584,7 @@ func (manager *ClientManager) handleSwitchToLive(client *Client) {
 	}
 	
 	manager.currentCaptureMode = "live"
+	manager.stateMutex.Unlock()
 	
 	// Send success response
 	response, _ := json.Marshal(map[string]interface{}{
@@ -592,7 +608,10 @@ func (manager *ClientManager) handleSeekToTime(msg map[string]interface{}, clien
 		return
 	}
 	
-	if manager.timeWindowProcessor == nil {
+	manager.stateMutex.RLock()
+	twp := manager.timeWindowProcessor
+	manager.stateMutex.RUnlock()
+	if twp == nil {
 		log.Printf("No time window processor active for seeking")
 		response, _ := json.Marshal(map[string]interface{}{
 			"type": "seek_error",
@@ -604,7 +623,7 @@ func (manager *ClientManager) handleSeekToTime(msg map[string]interface{}, clien
 	
 	log.Printf("⏰ Seeking to time: %s", seekTime.Format("15:04:05"))
 	
-	if err := manager.timeWindowProcessor.SeekToTime(seekTime); err != nil {
+	if err := twp.SeekToTime(seekTime); err != nil {
 		log.Printf("Failed to seek to time: %v", err)
 		response, _ := json.Marshal(map[string]interface{}{
 			"type": "seek_error",
@@ -815,8 +834,40 @@ func main() {
 		http.ServeFile(w, r, "public/index.html")
 	})
 
-	log.Printf("Starting server on %s", *addr)
-	if err := http.ListenAndServe(*addr, nil); err != nil {
-		log.Fatal("ListenAndServe: ", err)
+	srv := &http.Server{
+		Addr:              *addr,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
+
+	go func() {
+		log.Printf("Starting server on %s", *addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("ListenAndServe error: %v", err)
+		}
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	<-ctx.Done()
+	log.Println("Shutting down server gracefully...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	manager.stateMutex.Lock()
+	if manager.originalCapture != nil {
+		manager.originalCapture.Stop()
+	}
+	if manager.timeWindowProcessor != nil {
+		manager.timeWindowProcessor.Stop()
+	}
+	manager.stateMutex.Unlock()
+
+	log.Println("Server exited cleanly")
 }
