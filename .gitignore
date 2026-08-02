@@ -260,3 +260,9 @@ docs/generated/
 
 # Local testing harness (headless-browser layout verification, not committed)
 testing/
+
+# Apex Storage Design brag sheet + hardware snapshots (out of scope for vibes)
+apex-storage-design/
+
+# Superpowers skill scratch (brainstorm visual companion, SDD ledgers)
+.superpowers/

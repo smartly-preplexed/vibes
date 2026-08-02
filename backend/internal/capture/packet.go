@@ -760,6 +760,11 @@ func (r *RealCapture) capturePackets() {
 			srcIP := ip.SrcIP.String()
 			dstIP := ip.DstIP.String()
 
+			// Drop Layer-2 / malformed frames that parsed without real IPs.
+			if !validIPv4(srcIP) || !validIPv4(dstIP) {
+				continue
+			}
+
 			// Extract protocol and port information
 			var protocol string
 			var srcPort, dstPort int
@@ -1006,6 +1011,11 @@ func (p *PCAPReplayCapture) replayPackets(handle *pcap.Handle) {
 			// Extract IP addresses
 			srcIP := ip.SrcIP.String()
 			dstIP := ip.DstIP.String()
+
+			// Drop Layer-2 / malformed frames that parsed without real IPs.
+			if !validIPv4(srcIP) || !validIPv4(dstIP) {
+				continue
+			}
 
 			// Extract protocol and port information
 			var protocol string
@@ -1390,6 +1400,11 @@ func (twp *TimeWindowProcessor) readNextPacket() (*Packet, error) {
 	ip, _ := ipLayer.(*layers.IPv4)
 	srcIP := ip.SrcIP.String()
 	dstIP := ip.DstIP.String()
+
+	// Drop Layer-2 / malformed frames that parsed without real IPs.
+	if !validIPv4(srcIP) || !validIPv4(dstIP) {
+		return twp.readNextPacket()
+	}
 
 	// Extract protocol and port information
 	var protocol string

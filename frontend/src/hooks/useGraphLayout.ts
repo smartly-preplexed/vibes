@@ -21,6 +21,7 @@ export interface LayoutNode {
   alpha: number;
   lastActive: number;
   pinned: boolean;
+  focus: boolean;   // part of a central "focus burst" (scan hub or its target)
 }
 
 export interface LayoutEdge {
@@ -44,6 +45,10 @@ export interface GraphLayoutResult {
 const PHYSICS_HZ = 30;
 const PHYSICS_STEP = 1000 / PHYSICS_HZ;
 const NODE_RADIUS = 8;
+// A pinned node with no live connection for this long fades out and is removed
+// (the pin RULE stays — it re-docks if the host talks again).
+const PIN_IDLE_MS = 60000;
+const PIN_FADE_MS = 5000;
 const QUIET_EDGE_PADDING = 120;
 const DRIFT_GRACE_MS = 1500;
 const CLUSTER_RADIUS = 110;
@@ -188,10 +193,10 @@ export function useGraphLayout(): GraphLayoutResult {
   const clusterSlots = useRef<Map<string, { index: number; lastSeen: number }>>(new Map());
   const nextSlot = useRef<number>(0);
   const clusterTargets = useRef<Map<string, { x: number; y: number }>>(new Map());
-  // Pinned nodes that have had at least one live connection since page load.
-  // Once here, a node stays docked on screen until refresh even if the store
-  // prunes it — this is what makes pins "sticky" for the whole session.
-  const pinnedSeen = useRef<Set<string>>(new Set());
+  // Pinned node id → timestamp of its last live connection. A docked pin stays
+  // on screen (even if the store prunes it) until it has been idle for
+  // PIN_IDLE_MS, then it fades out and is removed.
+  const pinnedLastConn = useRef<Map<string, number>>(new Map());
   const physicsRef = useRef(usePhysicsStore.getState());
   const viewportRef = useRef({ width: 0, height: 0 });
 
@@ -233,9 +238,10 @@ export function useGraphLayout(): GraphLayoutResult {
     // connected stays put even after the store prunes it, so docked pins never
     // vanish mid-session.
     for (const id of layoutNodes.current.keys()) {
-      if (!storeById.has(id) && !(isPined(id) && pinnedSeen.current.has(id))) {
+      const keepPinned = isPined(id) && (now - (pinnedLastConn.current.get(id) ?? 0) < PIN_IDLE_MS);
+      if (!storeById.has(id) && !keepPinned) {
         layoutNodes.current.delete(id);
-        pinnedSeen.current.delete(id);
+        pinnedLastConn.current.delete(id);
       }
     }
 
@@ -338,6 +344,7 @@ export function useGraphLayout(): GraphLayoutResult {
           alpha: 1,
           lastActive: sn.lastActive,
           pinned: false,
+          focus: false,
         };
         layoutNodes.current.set(id, newNode);
         if (!clusterSeed.has(clusterKey)) clusterSeed.set(clusterKey, newNode);
@@ -395,16 +402,16 @@ export function useGraphLayout(): GraphLayoutResult {
       }
     });
 
-    // Density-adaptive spacing: at 150 nodes you get roomy ~50px gaps, at 1000
-    // nodes gaps shrink so the population can tile the screen instead of
-    // grinding against a fixed 75px footprint it can never satisfy.
+    // Spacing honours the slider directly, capped only by what the whole WORLD
+    // (not the viewport) can physically hold at this population — so on a big
+    // 4K world a 300px setting really spreads nodes out instead of being
+    // throttled to ~150px by a viewport-area cap. The cap only kicks in when the
+    // population genuinely can't fit at the requested spacing (prevents grinding).
     const width = vp.width || 1280;
     const height = vp.height || 800;
     const population = Math.max(1, layoutNodes.current.size);
-    const adaptiveSpacing = Math.min(
-      nodeSpacing,
-      Math.max(12, Math.sqrt((width * height * 0.7) / population) - NODE_RADIUS * 2)
-    );
+    const worldCap = Math.max(12, Math.sqrt((worldW * worldH) / population) - NODE_RADIUS * 2);
+    const adaptiveSpacing = Math.min(nodeSpacing, worldCap);
     const minPairDist = NODE_RADIUS * 2 + adaptiveSpacing;
 
     // ── Hex territories for ALL subnets (importance-ordered) ─────────────────
@@ -465,6 +472,54 @@ export function useGraphLayout(): GraphLayoutResult {
       clusterHome.set(key, t);
     });
 
+    // ── Focus bursts: surface scan / fan-out hubs to the centre ──────────────
+    // Interest = distinct live peers (fan-out breadth) + distinct dst ports
+    // (port-sweep breadth). The few highest-interest hosts (a scan is one host
+    // hitting many hosts across many ports) are pulled to the centre and their
+    // targets arranged in a radial burst around them — a readable nmap "star".
+    // Everything else is bulk context (dimmed by the renderer).
+    const fanOut = new Map<string, Set<string>>();
+    const scanPorts = new Map<string, Set<number>>();
+    const addTo = <T,>(m: Map<string, Set<T>>, k: string, v: T) => {
+      let s = m.get(k); if (!s) { s = new Set(); m.set(k, s); } s.add(v);
+    };
+    layoutEdges.current.forEach(edge => {
+      if (now - edge.lastActive > connectionLifetime) return;
+      addTo(fanOut, edge.sourceId, edge.targetId);
+      addTo(fanOut, edge.targetId, edge.sourceId);
+      if (edge.dstPort) addTo(scanPorts, edge.sourceId, edge.dstPort);
+    });
+    const interestOf = (id: string) => (fanOut.get(id)?.size ?? 0) + (scanPorts.get(id)?.size ?? 0) * 1.5;
+    const FOCUS_MAX = 4;
+    const FOCUS_THRESHOLD = 8;          // genuine fan-out, not 1:1 chatter
+    const hubs = Array.from(layoutNodes.current.keys())
+      .filter(id => !isPined(id) && interestOf(id) >= FOCUS_THRESHOLD)
+      .sort((a, b) => interestOf(b) - interestOf(a))
+      .slice(0, FOCUS_MAX);
+    const burstTarget = new Map<string, { x: number; y: number }>();
+    const focusSet = new Set<string>();
+    const minDim = Math.min(worldW, worldH);
+    hubs.forEach((hubId, hi) => {
+      focusSet.add(hubId);
+      // Spread multiple hubs on a tight ring around centre so the burst reads as
+      // one central cluster, not scattered off-centre.
+      const hubAng = hubs.length > 1 ? (hi / hubs.length) * Math.PI * 2 : 0;
+      const hubR = hubs.length > 1 ? minDim * 0.06 : 0;
+      const hx = centerX + Math.cos(hubAng) * hubR;
+      const hy = centerY + Math.sin(hubAng) * hubR;
+      burstTarget.set(hubId, { x: hx, y: hy });
+      const victims = Array.from(fanOut.get(hubId) ?? []);
+      const rBurst = Math.min(minDim * 0.26, Math.max(minPairDist * 2, minPairDist * Math.sqrt(victims.length) * 0.7));
+      victims.forEach(vid => {
+        if (isPined(vid) || focusSet.has(vid)) return;   // don't steal pins / other hubs' nodes
+        const nh = hashStr(vid);
+        const ang = (nh % 360) * Math.PI / 180;
+        const rr = rBurst * (0.55 + ((nh >> 9) % 100) / 100 * 0.45);
+        burstTarget.set(vid, { x: hx + Math.cos(ang) * rr, y: hy + Math.sin(ang) * rr });
+        focusSet.add(vid);
+      });
+    });
+
     // ── Pinned nodes dock in a fixed SCREEN-space frame ──────────────────────
     // Straight down the right edge (below the top-right debug panel), then
     // wrapping right→left across the bottom; overflow stacks upward so a full
@@ -480,11 +535,12 @@ export function useGraphLayout(): GraphLayoutResult {
     const dockRightX = screenW - 55;
     const dockTopY = 300;
     const dockBottomY = screenH - 45;
-    const vStep = 46;
-    const hStep = 135;
+    const vStep = 64;   // more vertical room per pin so its neighbour fan doesn't crowd the next pin
+    const hStep = 150;
     const leftMargin = 60;
     const rightColCount = Math.max(1, Math.floor((dockBottomY - dockTopY) / vStep));
     const bottomCols = Math.max(1, Math.floor((dockRightX - leftMargin) / hStep));
+    const pinExpired: string[] = [];
     pinnedList.forEach((node, i) => {
       let sx: number, sy: number;
       if (i < rightColCount) {
@@ -501,14 +557,31 @@ export function useGraphLayout(): GraphLayoutResult {
       node.y = sy / camera.zoom + camera.y;
       node.vx = 0;
       node.vy = 0;
-      node.alpha = 1;                                   // docked pins stay visible
-      if (connectedIds.has(node.id)) pinnedSeen.current.add(node.id); // sticky
+      // Track last live connection; fade over the final PIN_FADE_MS and expire
+      // after PIN_IDLE_MS of no connection (the pin rule survives — it re-docks
+      // if the host talks again).
+      if (connectedIds.has(node.id)) pinnedLastConn.current.set(node.id, now);
+      const idle = now - (pinnedLastConn.current.get(node.id) ?? now);
+      if (idle >= PIN_IDLE_MS) {
+        pinExpired.push(node.id);
+        node.alpha = 0;
+      } else {
+        node.alpha = idle > PIN_IDLE_MS - PIN_FADE_MS
+          ? Math.max(0, (PIN_IDLE_MS - idle) / PIN_FADE_MS)
+          : 1;
+      }
+    });
+    pinExpired.forEach(id => {
+      layoutNodes.current.delete(id);
+      pinnedLastConn.current.delete(id);
+      useNetworkStore.getState().removeNode(id);
     });
 
-    // Neighbours of pinned nodes get an attractor = the dock position of the
-    // pinned node they talk to (strongest edge wins), so live conversations
-    // migrate UP TO the dock instead of lingering in their home territory.
-    const pinAttractor = new Map<string, { x: number; y: number; w: number }>();
+    // Neighbours of pinned nodes migrate to the dock, but instead of piling on
+    // the pin they fan out on a compact arc opening toward screen centre (so a
+    // right-edge pin's talkers spread left into open canvas, a bottom pin's
+    // spread up). Strongest edge decides which pin a neighbour belongs to.
+    const pinNbrs = new Map<string, { pinId: string; w: number }>();
     layoutEdges.current.forEach(edge => {
       if (now - edge.lastActive > connectionLifetime) return;
       const s = layoutNodes.current.get(edge.sourceId);
@@ -516,8 +589,30 @@ export function useGraphLayout(): GraphLayoutResult {
       if (!s || !t || s.pinned === t.pinned) return;    // need exactly one pinned
       const pin = s.pinned ? s : t;
       const nb = s.pinned ? t : s;
-      const cur = pinAttractor.get(nb.id);
-      if (!cur || edge.weight > cur.w) pinAttractor.set(nb.id, { x: pin.x, y: pin.y, w: edge.weight });
+      const cur = pinNbrs.get(nb.id);
+      if (!cur || edge.weight > cur.w) pinNbrs.set(nb.id, { pinId: pin.id, w: edge.weight });
+    });
+    const byPin = new Map<string, string[]>();
+    pinNbrs.forEach((v, nbId) => {
+      const arr = byPin.get(v.pinId);
+      if (arr) arr.push(nbId); else byPin.set(v.pinId, [nbId]);
+    });
+    const pinAttractor = new Map<string, { x: number; y: number }>();
+    const fanGap = NODE_RADIUS * 2 + 26;              // compact, dock-local spacing
+    byPin.forEach((nbIds, pinId) => {
+      const pin = layoutNodes.current.get(pinId);
+      if (!pin) return;
+      nbIds.sort();
+      let ix = centerX - pin.x, iy = centerY - pin.y;  // inward = toward screen centre
+      const il = Math.hypot(ix, iy) || 1; ix /= il; iy /= il;
+      const inwardAng = Math.atan2(iy, ix);
+      const n = nbIds.length;
+      const R = Math.max(fanGap * 1.6, (fanGap * n) / Math.PI);  // radius grows with count
+      const step = fanGap / R;                         // ~fanGap arc spacing between neighbours
+      nbIds.forEach((nbId, k) => {
+        const a = inwardAng + (k - (n - 1) / 2) * step;
+        pinAttractor.set(nbId, { x: pin.x + Math.cos(a) * R, y: pin.y + Math.sin(a) * R });
+      });
     });
 
     // Per-node home = subnet hex center + a deterministic spread. Territory SIZE
@@ -529,6 +624,7 @@ export function useGraphLayout(): GraphLayoutResult {
     const territoryRadius = (key: string) =>
       Math.max(hexSize * 0.3, minPairDist * Math.sqrt(subnetPop.get(key) ?? 1) * 0.55);
     layoutNodes.current.forEach(node => {
+      node.focus = focusSet.has(node.id);
       const h = clusterHome.get(node.clusterKey);
       if (h) {
         const nh = hashStr(node.id);
@@ -547,6 +643,17 @@ export function useGraphLayout(): GraphLayoutResult {
         // travel all the way to the pin and cluster beside it.
         node.vx += (attractor.x - node.x) * 0.05 * dtNorm;
         node.vy += (attractor.y - node.y) * 0.05 * dtNorm;
+        return;
+      }
+
+      const burst = burstTarget.get(node.id);
+      if (burst) {
+        // Focus hub or one of its targets → pull hard into the central burst,
+        // overriding territory home so the whole scan pattern gathers in the
+        // middle as a readable star (springs on these edges are weak, so this
+        // pull sets the geometry).
+        node.vx += (burst.x - node.x) * 0.09 * dtNorm;
+        node.vy += (burst.y - node.y) * 0.09 * dtNorm;
         return;
       }
 
@@ -720,10 +827,14 @@ export function useGraphLayout(): GraphLayoutResult {
       // neighbour sits right beside the dock (the attractor already walks it
       // there; this keeps it snug instead of held off at a long rest length).
       const pinEdge = source.pinned || target.pinned;
+      // Pin and focus (burst) edges: the attractor arc / burst target defines the
+      // geometry, so keep these springs very weak — they draw the spoke without
+      // collapsing the arrangement onto the anchor.
+      const focusEdge = (source.focus || target.focus) && !pinEdge;
       const restLength = pinEdge
         ? NODE_RADIUS * 2 + adaptiveSpacing * 0.5
         : sameCluster ? tightRest : tightRest + Math.min(320, hexSize * 0.6);
-      const clusterResponse = pinEdge ? 1.3 : sameCluster ? 1.05 : 0.4;
+      const clusterResponse = (pinEdge ? 1.3 : sameCluster ? 1.05 : 0.4) * (pinEdge || focusEdge ? 0.15 : 1);
       const displacement = Math.max(-400, Math.min(400, dist - restLength));
       const spring = connectionPullStrength * 0.007 * clusterResponse * weightResponse * degreeResponse * displacement * dtNorm;
       const nx = dx / dist;
