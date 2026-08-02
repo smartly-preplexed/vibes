@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -114,7 +115,7 @@ type PacketCapture interface {
 type SimulatedCapture struct {
 	packetChan chan *Packet
 	stopChan   chan bool
-	running    bool
+	running    atomic.Bool
 }
 
 // NewSimulatedCapture creates a new simulated capture
@@ -122,28 +123,27 @@ func NewSimulatedCapture() *SimulatedCapture {
 	return &SimulatedCapture{
 		packetChan: make(chan *Packet, 1000), // Increased buffer for busy network simulation
 		stopChan:   make(chan bool, 1),
-		running:    false,
 	}
 }
 
 // Start begins the simulated packet capture
 func (s *SimulatedCapture) Start() error {
-	if s.running {
+	if s.running.Load() {
 		return fmt.Errorf("capture already running")
 	}
 
-	s.running = true
+	s.running.Store(true)
 	go s.generatePackets()
 	return nil
 }
 
 // Stop stops the simulated packet capture
 func (s *SimulatedCapture) Stop() error {
-	if !s.running {
+	if !s.running.Load() {
 		return fmt.Errorf("capture not running")
 	}
 
-	s.running = false
+	s.running.Store(false)
 	select {
 	case s.stopChan <- true:
 	default:
@@ -524,7 +524,7 @@ func (s *SimulatedCapture) generatePackets() {
 
 // sendPacket creates and sends a packet
 func (s *SimulatedCapture) sendPacket(src, dst string, size int, protocol string) {
-	if !s.running {
+	if !s.running.Load() {
 		return
 	}
 	// Generate realistic ports based on protocol
@@ -564,7 +564,7 @@ func (s *SimulatedCapture) simulateDataBurst(external, gateway, server string) {
 	// Server responds with burst of data packets (5-15 packets)
 	burstSize := 5 + rand.Intn(10)
 	for i := 0; i < burstSize; i++ {
-		if !s.running {
+		if !s.running.Load() {
 			return
 		}
 		packetSize := 800 + rand.Intn(700) // 800-1500 bytes
@@ -576,7 +576,7 @@ func (s *SimulatedCapture) simulateDataBurst(external, gateway, server string) {
 
 	// Gateway forwards responses back to external
 	for i := 0; i < burstSize/2; i++ {
-		if !s.running {
+		if !s.running.Load() {
 			return
 		}
 		responseSize := 1200 + rand.Intn(300) // 1200-1500 bytes
@@ -607,7 +607,7 @@ func (s *SimulatedCapture) simulateLocalDataBurst(src, dst string) {
 	// Data transfer burst (10-30 packets)
 	burstSize := 10 + rand.Intn(20)
 	for i := 0; i < burstSize; i++ {
-		if !s.running {
+		if !s.running.Load() {
 			return
 		}
 		packetSize := 500 + rand.Intn(1000) // 500-1500 bytes
@@ -626,7 +626,7 @@ func (s *SimulatedCapture) simulateLocalDataBurst(src, dst string) {
 type RealCapture struct {
 	packetChan chan *Packet
 	stopChan   chan bool
-	running    bool
+	running    atomic.Bool
 	handle     *pcap.Handle
 	iface      string
 }
@@ -636,14 +636,13 @@ func NewRealCapture(iface string) *RealCapture {
 	return &RealCapture{
 		packetChan: make(chan *Packet, 10000), // Massive buffer for high-throughput real capture
 		stopChan:   make(chan bool, 1),
-		running:    false,
 		iface:      iface,
 	}
 }
 
 // Start begins the real packet capture
 func (r *RealCapture) Start() error {
-	if r.running {
+	if r.running.Load() {
 		return fmt.Errorf("capture already running")
 	}
 
@@ -692,18 +691,18 @@ func (r *RealCapture) Start() error {
 	log.Printf("Successfully started real packet capture on interface '%s'", r.iface)
 
 	// Start packet processing
-	r.running = true
+	r.running.Store(true)
 	go r.capturePackets()
 	return nil
 }
 
 // Stop stops the real packet capture
 func (r *RealCapture) Stop() error {
-	if !r.running {
+	if !r.running.Load() {
 		return fmt.Errorf("capture not running")
 	}
 
-	r.running = false
+	r.running.Store(false)
 	if r.handle != nil {
 		r.handle.Close()
 	}
@@ -736,7 +735,7 @@ func (r *RealCapture) capturePackets() {
 		default:
 			packet, err := packetSource.NextPacket()
 			if err != nil {
-				if !r.running {
+				if !r.running.Load() {
 					return
 				}
 				log.Printf("Error reading packet: %v", err)
@@ -833,7 +832,7 @@ func ListInterfaces() ([]pcap.Interface, error) {
 type PCAPReplayCapture struct {
 	packetChan        chan *Packet
 	stopChan          chan bool
-	running           bool
+	running           atomic.Bool
 	pcapFile          string
 	replaySpeed       float64 // 1.0 = real-time, 2.0 = 2x speed, 0.5 = half speed
 	startTime         time.Time
@@ -856,7 +855,6 @@ func NewPCAPReplayCapture(config PCAPReplayConfig) *PCAPReplayCapture {
 	replay := &PCAPReplayCapture{
 		packetChan:   make(chan *Packet, 1000),
 		stopChan:     make(chan bool, 1),
-		running:      false,
 		pcapFile:     config.FilePath,
 		replaySpeed:  config.ReplaySpeed,
 		useTimeRange: false,
@@ -879,7 +877,7 @@ func NewPCAPReplayCapture(config PCAPReplayConfig) *PCAPReplayCapture {
 
 // Start begins the PCAP replay
 func (p *PCAPReplayCapture) Start() error {
-	if p.running {
+	if p.running.Load() {
 		return fmt.Errorf("PCAP replay already running")
 	}
 
@@ -897,7 +895,7 @@ func (p *PCAPReplayCapture) Start() error {
 
 	log.Printf("Successfully opened PCAP file: %s", p.pcapFile)
 
-	p.running = true
+	p.running.Store(true)
 	p.replayStartTime = time.Now()
 
 	// Start replay processing in goroutine
@@ -907,11 +905,11 @@ func (p *PCAPReplayCapture) Start() error {
 
 // Stop stops the PCAP replay
 func (p *PCAPReplayCapture) Stop() error {
-	if !p.running {
+	if !p.running.Load() {
 		return fmt.Errorf("PCAP replay not running")
 	}
 
-	p.running = false
+	p.running.Store(false)
 	select {
 	case p.stopChan <- true:
 	default:
@@ -1076,7 +1074,7 @@ func (p *PCAPReplayCapture) replayPackets(handle *pcap.Handle) {
 type TimeWindowProcessor struct {
 	packetChan      chan *Packet
 	stopChan        chan bool
-	running         bool
+	running         atomic.Bool
 	storageDir      string
 	startTime       time.Time
 	endTime         time.Time
@@ -1131,7 +1129,6 @@ func NewTimeWindowProcessor(config TimeWindowConfig) *TimeWindowProcessor {
 		stopChan:       make(chan bool, 1),
 		transitionChan: make(chan string, 10),
 		seekChan:       make(chan time.Time, 10),
-		running:        false,
 		storageDir:     config.StorageDir,
 		startTime:      config.StartTime,
 		endTime:        config.EndTime,
@@ -1143,7 +1140,7 @@ func NewTimeWindowProcessor(config TimeWindowConfig) *TimeWindowProcessor {
 
 // Start begins time window processing
 func (twp *TimeWindowProcessor) Start() error {
-	if twp.running {
+	if twp.running.Load() {
 		return fmt.Errorf("time window processor already running")
 	}
 
@@ -1161,7 +1158,7 @@ func (twp *TimeWindowProcessor) Start() error {
 
 	log.Printf("📁 Found %d files spanning time window", len(twp.fileSequence))
 
-	twp.running = true
+	twp.running.Store(true)
 	twp.replayStartTime = time.Now()
 
 	// Start processing goroutine
@@ -1171,11 +1168,11 @@ func (twp *TimeWindowProcessor) Start() error {
 
 // Stop stops the time window processor
 func (twp *TimeWindowProcessor) Stop() error {
-	if !twp.running {
+	if !twp.running.Load() {
 		return fmt.Errorf("time window processor not running")
 	}
 
-	twp.running = false
+	twp.running.Store(false)
 	if twp.currentFile != nil {
 		twp.currentFile.Close()
 	}
@@ -1194,7 +1191,7 @@ func (twp *TimeWindowProcessor) GetPacketChannel() <-chan *Packet {
 
 // SeekToTime jumps to a specific time in the window
 func (twp *TimeWindowProcessor) SeekToTime(targetTime time.Time) error {
-	if !twp.running {
+	if !twp.running.Load() {
 		return fmt.Errorf("processor not running")
 	}
 
@@ -1279,7 +1276,7 @@ func (twp *TimeWindowProcessor) processTimeWindow() {
 	}
 
 	packetCount := 0
-	for twp.running {
+	for twp.running.Load() {
 		select {
 		case <-twp.stopChan:
 			log.Printf("Time window processor stopped")
@@ -1513,7 +1510,7 @@ func (twp *TimeWindowProcessor) fileContainsTime(filePath string, targetTime tim
 type DumpcapCapture struct {
 	packetChan   chan *Packet
 	stopChan     chan bool
-	running      bool
+	running      atomic.Bool
 	dumpcapDir   string
 	currentFile  string
 	fileWatcher  *os.File
@@ -1527,7 +1524,6 @@ func NewDumpcapCapture(dumpcapDir string, iface string) *DumpcapCapture {
 	return &DumpcapCapture{
 		packetChan: make(chan *Packet, 1000), // Larger buffer for high-throughput
 		stopChan:   make(chan bool, 1),
-		running:    false,
 		dumpcapDir: dumpcapDir,
 		iface:      iface,
 	}
@@ -1535,7 +1531,7 @@ func NewDumpcapCapture(dumpcapDir string, iface string) *DumpcapCapture {
 
 // Start begins monitoring dumpcap output files
 func (d *DumpcapCapture) Start() error {
-	if d.running {
+	if d.running.Load() {
 		return fmt.Errorf("dumpcap capture already running")
 	}
 
@@ -1546,18 +1542,18 @@ func (d *DumpcapCapture) Start() error {
 		return fmt.Errorf("dumpcap directory does not exist: %s", d.dumpcapDir)
 	}
 
-	d.running = true
+	d.running.Store(true)
 	go d.monitorFiles()
 	return nil
 }
 
 // Stop stops the dumpcap monitoring
 func (d *DumpcapCapture) Stop() error {
-	if !d.running {
+	if !d.running.Load() {
 		return fmt.Errorf("dumpcap capture not running")
 	}
 
-	d.running = false
+	d.running.Store(false)
 	if d.pcapHandle != nil {
 		d.pcapHandle.Close()
 	}

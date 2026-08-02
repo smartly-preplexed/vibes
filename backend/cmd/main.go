@@ -66,22 +66,31 @@ type ClientManager struct {
 	pinningRules       []string
 	rulesMutex         sync.RWMutex
 	stateMutex         sync.RWMutex
+	modeChanged        chan struct{}
 	timeWindowProcessor *capture.TimeWindowProcessor
 	currentCaptureMode  string
 	originalCapture     capture.PacketCapture
 }
 
-func (manager *ClientManager) getActiveCaptureChannel() (<-chan *capture.Packet, string) {
+func (manager *ClientManager) signalModeChangeLocked() {
+	if manager.modeChanged != nil {
+		close(manager.modeChanged)
+	}
+	manager.modeChanged = make(chan struct{})
+}
+
+func (manager *ClientManager) getActiveCaptureChannel() (<-chan *capture.Packet, <-chan struct{}, string) {
 	manager.stateMutex.RLock()
 	defer manager.stateMutex.RUnlock()
 
+	modeChanged := manager.modeChanged
 	if manager.timeWindowProcessor != nil && manager.currentCaptureMode == "time_window" {
-		return manager.timeWindowProcessor.GetPacketChannel(), "time_window"
+		return manager.timeWindowProcessor.GetPacketChannel(), modeChanged, "time_window"
 	}
 	if manager.originalCapture != nil {
-		return manager.originalCapture.GetPacketChannel(), manager.currentCaptureMode
+		return manager.originalCapture.GetPacketChannel(), modeChanged, manager.currentCaptureMode
 	}
-	return nil, ""
+	return nil, modeChanged, ""
 }
 
 func NewClientManager() *ClientManager {
@@ -91,6 +100,7 @@ func NewClientManager() *ClientManager {
 		register:     make(chan *Client),
 		unregister:   make(chan *Client),
 		pinningRules: make([]string, 0),
+		modeChanged:  make(chan struct{}),
 	}
 }
 
@@ -351,7 +361,7 @@ func (manager *ClientManager) HandleWebSocket(w http.ResponseWriter, r *http.Req
 			var packet *capture.Packet
 			var packetReceived bool
 			
-			packetChan, _ := manager.getActiveCaptureChannel()
+			packetChan, modeChanged, _ := manager.getActiveCaptureChannel()
 			if packetChan == nil {
 				time.Sleep(10 * time.Millisecond)
 				continue
@@ -360,6 +370,8 @@ func (manager *ClientManager) HandleWebSocket(w http.ResponseWriter, r *http.Req
 			select {
 			case packet = <-packetChan:
 				packetReceived = true
+			case <-modeChanged:
+				continue
 			case <-client.stopForwarder:
 				return
 			}
@@ -533,6 +545,9 @@ func (manager *ClientManager) handleTimeWindowCommand(msg map[string]interface{}
 	
 	// Start time window playback
 	if err := processor.Start(); err != nil {
+		if manager.originalCapture != nil {
+			_ = manager.originalCapture.Start()
+		}
 		manager.stateMutex.Unlock()
 		log.Printf("Failed to start time window playback: %v", err)
 		response, _ := json.Marshal(map[string]interface{}{
@@ -545,6 +560,7 @@ func (manager *ClientManager) handleTimeWindowCommand(msg map[string]interface{}
 	
 	manager.timeWindowProcessor = processor
 	manager.currentCaptureMode = "time_window"
+	manager.signalModeChangeLocked()
 	manager.stateMutex.Unlock()
 	
 	// Send success response
@@ -572,6 +588,9 @@ func (manager *ClientManager) handleSwitchToLive(client *Client) {
 	// Restart original capture
 	if manager.originalCapture != nil {
 		if err := manager.originalCapture.Start(); err != nil {
+			if manager.timeWindowProcessor != nil {
+				_ = manager.timeWindowProcessor.Start()
+			}
 			manager.stateMutex.Unlock()
 			log.Printf("Failed to restart live capture: %v", err)
 			response, _ := json.Marshal(map[string]interface{}{
@@ -584,6 +603,7 @@ func (manager *ClientManager) handleSwitchToLive(client *Client) {
 	}
 	
 	manager.currentCaptureMode = "live"
+	manager.signalModeChangeLocked()
 	manager.stateMutex.Unlock()
 	
 	// Send success response
