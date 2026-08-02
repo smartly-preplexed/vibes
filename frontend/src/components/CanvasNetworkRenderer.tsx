@@ -89,6 +89,10 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
     });
 
     // ── Draw edges ──────────────────────────────────────────────────────────
+    // Budget for port labels shown at the zoomed-out overview (interesting
+    // edges only) so scan ports read without diving all the way in.
+    let portLabels = 0;
+    const portLabelBoxes: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
     edges.forEach(edge => {
       const src = nodes.get(edge.sourceId);
       const tgt = nodes.get(edge.targetId);
@@ -109,15 +113,38 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       ctx.lineTo(tgt.x, tgt.y);
       ctx.stroke();
 
-      // Port/protocol label — only when zoomed in
-      if (vp.zoom > 1.5 && (edge.dstPort ?? 0) > 0) {
-        const label = `${edge.protocol?.toUpperCase() ?? ''}:${edge.dstPort}`;
-        const mx    = (src.x + tgt.x) / 2;
-        const my    = (src.y + tgt.y) / 2;
-        ctx.font      = '9px monospace';
+      // Port/protocol label. Show ALL of them when zoomed in; at the overview,
+      // show only interesting edges (high fan-out degree, or touching a pinned
+      // node) up to a budget, so scans reveal their target ports without having
+      // to zoom all the way in. dstPort is the store's latest, so a connection
+      // that switches ports relabels automatically.
+      const interestingEdge = degree >= 6 || src.pinned || tgt.pinned;
+      const showPort = (edge.dstPort ?? 0) > 0 && (
+        vp.zoom > 1.5 ||
+        (interestingEdge && vp.zoom >= FIT_ZOOM * 0.9 && portLabels < 70)
+      );
+      if (showPort) {
+        const label   = `${edge.protocol?.toUpperCase() ?? ''}:${edge.dstPort}`;
+        const fontSize = 11 / vp.zoom;                 // constant screen px
+        const mx = (src.x + tgt.x) / 2;
+        const my = (src.y + tgt.y) / 2;
+        ctx.font = `${fontSize}px monospace`;
         ctx.textAlign = 'center';
-        ctx.fillStyle = edgeColor(edge.protocol, edge.alpha, theme);
-        ctx.fillText(label, mx, my);
+        // Overview labels cull overlaps so the watch zone stays legible.
+        if (vp.zoom <= 1.5) {
+          const tw = ctx.measureText(label).width;
+          const box = { x1: mx - tw / 2, y1: my - fontSize, x2: mx + tw / 2, y2: my + fontSize };
+          const clash = portLabelBoxes.some(b => box.x1 < b.x2 && box.x2 > b.x1 && box.y1 < b.y2 && box.y2 > b.y1);
+          if (!clash) {
+            portLabelBoxes.push(box);
+            ctx.fillStyle = edgeColor(edge.protocol, Math.min(1, edge.alpha + 0.4), theme);
+            ctx.fillText(label, mx, my);
+            portLabels++;
+          }
+        } else {
+          ctx.fillStyle = edgeColor(edge.protocol, edge.alpha, theme);
+          ctx.fillText(label, mx, my);
+        }
       }
     });
 
