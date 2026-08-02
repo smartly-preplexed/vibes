@@ -579,17 +579,18 @@ func (manager *ClientManager) handleSwitchToLive(client *Client) {
 	log.Printf("🔄 Switching back to live mode...")
 	
 	manager.stateMutex.Lock()
-	// Stop time window processor
-	if manager.timeWindowProcessor != nil {
-		manager.timeWindowProcessor.Stop()
-		manager.timeWindowProcessor = nil
+	prev := manager.timeWindowProcessor
+	if prev != nil {
+		prev.Stop()
 	}
 	
 	// Restart original capture
 	if manager.originalCapture != nil {
 		if err := manager.originalCapture.Start(); err != nil {
-			if manager.timeWindowProcessor != nil {
-				_ = manager.timeWindowProcessor.Start()
+			if prev != nil {
+				manager.timeWindowProcessor = prev
+				_ = prev.Start()
+				// leave currentCaptureMode as time_window
 			}
 			manager.stateMutex.Unlock()
 			log.Printf("Failed to restart live capture: %v", err)
@@ -602,6 +603,7 @@ func (manager *ClientManager) handleSwitchToLive(client *Client) {
 		}
 	}
 	
+	manager.timeWindowProcessor = nil
 	manager.currentCaptureMode = "live"
 	manager.signalModeChangeLocked()
 	manager.stateMutex.Unlock()
