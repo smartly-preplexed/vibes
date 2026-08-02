@@ -114,14 +114,14 @@ export const PhysicsPanel: React.FC = () => {
         <RangeSlider
           label="Connection Lifetime"
           value={connectionLifetime}
-          min="1000"
-          max="60000"
-          step="1000"
+          min="0"
+          max="5000"
+          step="50"
           onChange={(v) => {
             setConnectionLifetime(v);
             if (v > nodeLifetime) setNodeLifetime(v);
           }}
-          displayValue={`${(connectionLifetime / 1000).toFixed(0)}s`}
+          displayValue={`${connectionLifetime} ms`}
         />
         <RangeSlider
           label="Node Lifetime"
