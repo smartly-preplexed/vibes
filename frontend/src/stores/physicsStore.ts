@@ -6,41 +6,63 @@ export interface PhysicsSettings {
   collisionRepulsion: number;
   damping: number;
   connectionLifetime: number;
+  nodeLifetime: number;
   nodeSpacing: number;
   driftAwayStrength: number;
-  setConnectionPullStrength: (strength: number) => void;
-  setCollisionRepulsion: (repulsion: number) => void;
-  setDamping: (damping: number) => void;
-  setConnectionLifetime: (lifetime: number) => void;
-  setNodeSpacing: (spacing: number) => void;
-  setDriftAwayStrength: (strength: number) => void;
+  centerPullStrength: number;
+  springRestLength: number;
+  setConnectionPullStrength: (v: number) => void;
+  setCollisionRepulsion: (v: number) => void;
+  setDamping: (v: number) => void;
+  setConnectionLifetime: (v: number) => void;
+  setNodeLifetime: (v: number) => void;
+  setNodeSpacing: (v: number) => void;
+  setDriftAwayStrength: (v: number) => void;
+  setCenterPullStrength: (v: number) => void;
+  setSpringRestLength: (v: number) => void;
   resetPhysicsDefaults: () => void;
 }
 
 const defaultPhysics = {
-    connectionPullStrength: 1.30,
-    collisionRepulsion: 1.25,
-    damping: 0.06,
-    connectionLifetime: 1200,
-    nodeSpacing: 150,
-    driftAwayStrength: 3.0,
+  connectionPullStrength: 1.45,
+  collisionRepulsion: 0.35,
+  damping: 0.35,            // strong decay so the layout settles instead of oscillating
+  connectionLifetime: 5000,
+  nodeLifetime: 15000,
+  nodeSpacing: 75,
+  driftAwayStrength: 2.4,
+  centerPullStrength: 0.002, // weak territorial bias toward each node's subnet home
+  springRestLength: 70,
 }
+
+// Increment to force-reset localStorage when defaults change
+const PHYSICS_VERSION = 21;
 
 export const usePhysicsStore = create<PhysicsSettings>()(
   persist(
     (set) => ({
       ...defaultPhysics,
-      setConnectionPullStrength: (strength) => set({ connectionPullStrength: strength }),
-      setCollisionRepulsion: (repulsion) => set({ collisionRepulsion: repulsion }),
-      setDamping: (damping) => set({ damping: damping }),
-      setConnectionLifetime: (lifetime) => set({ connectionLifetime: lifetime }),
-      setNodeSpacing: (spacing: number) => set({ nodeSpacing: spacing }),
-      setDriftAwayStrength: (strength: number) => set({ driftAwayStrength: strength }),
+      setConnectionPullStrength: (v) => set({ connectionPullStrength: v }),
+      setCollisionRepulsion: (v) => set({ collisionRepulsion: v }),
+      setDamping: (v) => set({ damping: v }),
+      setConnectionLifetime: (v) => set({ connectionLifetime: v }),
+      setNodeLifetime: (v) => set({ nodeLifetime: v }),
+      setNodeSpacing: (v) => set({ nodeSpacing: v }),
+      setDriftAwayStrength: (v) => set({ driftAwayStrength: v }),
+      setCenterPullStrength: (v) => set({ centerPullStrength: v }),
+      setSpringRestLength: (v) => set({ springRestLength: v }),
       resetPhysicsDefaults: () => set({ ...defaultPhysics }),
     }),
     {
-      name: 'physics-settings-storage', 
-      storage: createJSONStorage(() => localStorage), 
+      name: 'physics-settings-storage',
+      version: PHYSICS_VERSION,
+      storage: createJSONStorage(() => localStorage),
+      migrate: (persistedState: any, version: number) => {
+        if (version < PHYSICS_VERSION) {
+          return { ...defaultPhysics };
+        }
+        return persistedState;
+      },
     }
   )
-) 
+)

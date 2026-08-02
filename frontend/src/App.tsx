@@ -24,10 +24,25 @@ const IPDebugPage = lazy(() => import('./components/IPDebugPage').then(module =>
 import { CommandBar } from './components/CommandBar';
 
 // Status bar component with active panel
+const CAPTURE_SOURCE_LABELS: Record<string, string> = {
+  dumpcap: '🚀 DUMPCAP',
+  real: '📡 LIVE',
+  simulated: '🎮 SIM',
+  zeek: '🦅 ZEEK',
+  pcap_replay: '🎞️ PCAP',
+};
+
 const StatusBar = memo(({ status, error }: { status: string; error: string | null }) => {
   const { nodes, connections } = useNetworkStore();
   const { packets } = usePacketStore();
-  
+
+  // Capture source badge, derived from the actual packets flowing (the honest
+  // signal — reflects what the backend is really serving, not the UI's guess).
+  const latestSource = packets.length ? packets[packets.length - 1].source : undefined;
+  const sourceLabel = latestSource
+    ? (CAPTURE_SOURCE_LABELS[latestSource] ?? latestSource.toUpperCase())
+    : '— NO DATA';
+
   return (
     <div className="status-bar" style={{ zIndex: 999, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
@@ -38,22 +53,30 @@ const StatusBar = memo(({ status, error }: { status: string; error: string | nul
       
       
       {/* Active Panel - Shows current network activity */}
-      <div style={{ 
-        display: 'flex', 
-        alignItems: 'center', 
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
         gap: '15px',
         fontSize: '14px',
-        color: '#00ff00'
+        color: 'var(--vibes-primary, #00ff00)'
       }}>
+        <span style={{
+          fontWeight: 'bold',
+          padding: '2px 8px',
+          borderRadius: '3px',
+          border: '1px solid var(--vibes-primary, #00ff00)',
+          background: 'rgba(var(--vibes-primary-rgb, 0, 255, 0), 0.15)',
+          letterSpacing: '1px',
+        }}>{sourceLabel}</span>
         <span>📦 Packets: <strong style={{ color: '#fff' }}>{packets.length}</strong></span>
         <span>🔘 Nodes: <strong style={{ color: '#fff' }}>{nodes.length}</strong></span>
         <span>🔗 Connections: <strong style={{ color: '#fff' }}>{connections.length}</strong></span>
-        <span style={{ 
-          fontSize: '12px', 
-          padding: '2px 6px', 
-          background: nodes.length > 0 ? 'rgba(0, 255, 0, 0.2)' : 'rgba(255, 0, 0, 0.2)',
+        <span style={{
+          fontSize: '12px',
+          padding: '2px 6px',
+          background: nodes.length > 0 ? 'rgba(var(--vibes-primary-rgb, 0, 255, 0), 0.2)' : 'rgba(255, 0, 0, 0.2)',
           borderRadius: '3px',
-          border: `1px solid ${nodes.length > 0 ? '#00ff00' : '#ff0000'}`
+          border: `1px solid ${nodes.length > 0 ? 'var(--vibes-primary, #00ff00)' : '#ff0000'}`
         }}>
           {nodes.length > 0 ? '✅ ACTIVE' : '⚠️ WAITING'}
         </span>
@@ -104,17 +127,14 @@ export const App = memo(() => {
       return null;
     }
 
-    const wsHost = import.meta.env.VITE_BACKEND_HOST || 'localhost';
-    const wsPort = import.meta.env.VITE_BACKEND_PORT || '8080';
-    const devPorts = ['5173', '3000'];
-    const useViteProxy =
-      import.meta.env.DEV &&
-      !import.meta.env.VITE_BACKEND_HOST &&
-      !import.meta.env.VITE_BACKEND_PORT &&
-      devPorts.includes(window.location.port);
-    const wsBase = useViteProxy
-      ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
-      : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${wsHost}:${wsPort}`;
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    // ALWAYS connect the WebSocket back to whichever host:port served this page.
+    // This is correct behind the Vite dev proxy (localhost:5173 → /ws proxied to
+    // :8080) AND when the Go backend serves the built app in production (a remote
+    // client hitting 10.220.199.71:8080). We deliberately do NOT honor
+    // VITE_BACKEND_HOST here: frontend/.env pins it to "localhost", which would
+    // make every remote viewer try their OWN machine — the exact bug we hit.
+    const wsBase = `${proto}://${window.location.host}`;
 
     if (captureMode === 'real') {
       if (selectedInterface) {
@@ -158,6 +178,13 @@ export const App = memo(() => {
   
   // Process packets into nodes and connections
   usePacketProcessor()
+
+  // Periodically remove expired nodes and connections from the store
+  useEffect(() => {
+    const { removeInactiveElements } = useNetworkStore.getState();
+    const id = setInterval(removeInactiveElements, 5000);
+    return () => clearInterval(id);
+  }, [])
   
   // Check URL on initial load to see if real capture was requested
   useEffect(() => {
@@ -509,15 +536,7 @@ export const App = memo(() => {
           <IPDebugPage />
         ) : (
           <>
-            <div className="canvas-container" style={{
-              position: 'fixed',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              zIndex: 0,
-              overflow: 'hidden'
-            }}>
+            <div className="canvas-container">
               {/* Use the fully memoized renderer component for maximum stability */}
               {memoizedRenderer}
             </div>
@@ -571,13 +590,6 @@ export const App = memo(() => {
             />
           </>
         )}
-        
-        {/* Performance Test Data Generator (always active for both routes) */}
-        <PerformanceTestData 
-          enabled={performanceTestData.enabled}
-          nodeCount={performanceTestData.nodeCount}
-          connectionCount={performanceTestData.connectionCount}
-        />
         
         {error && (
           <div className="error-bar">

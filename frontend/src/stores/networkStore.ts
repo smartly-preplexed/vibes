@@ -9,15 +9,13 @@ import { logger } from '../utils/logger';
 export interface Node {
   id: string;
   label?: string;
-  x?: number;
-  y?: number;
   size?: number;
   color?: number;
   highlighted?: boolean;
-  lastActive: number; // Timestamp of last activity
+  lastActive: number;
   type?: string;
-  packetSource?: 'real' | 'simulated' | string // For identifying real vs simulated packets
-  packetColor?: string; // Color based on the packet that created this connection
+  packetSource?: 'real' | 'simulated' | string;
+  packetColor?: string;
   ports: Set<number>;
 }
 
@@ -33,14 +31,18 @@ export interface Connection {
   packetColor?: string; // Color based on the packet that created this connection
   srcPort?: number;
   dstPort?: number;
+  packetCount?: number;
+  byteCount?: number;
+  weight?: number;
 }
 
 interface NetworkState {
   nodes: Node[];
   connections: Connection[];
-  updateNodeActivity: (nodeId: string) => void;
+  updateNodeActivity: (nodeId: string, port?: number) => void;
   addOrUpdateNode: (node: Node) => void;
   addOrUpdateConnection: (connection: Connection) => void;
+  addFlowBatch: (flows: Array<{ src: Node; dst: Node; conn: Connection }>) => void;
   // Legacy/compatibility API methods
   addNode: (id: string, data?: Partial<Node>) => void;
   addConnection: (connection: Partial<Connection>) => void;
@@ -62,21 +64,25 @@ interface NetworkState {
 const NODE_EXPIRATION_TIME = 30000; // 30 seconds of inactivity before node starts fading
 const CONNECTION_EXPIRATION_TIME = 5000; // 5 seconds of inactivity before connection removal as requested
 
-// OPTIMIZED LIMITS: Set to 500 nodes as requested for performance
-const MAX_NODES = 1000; // REDUCED: Hard cap on node count to prevent slowdown (was 1000)
-const PRUNE_TO_COUNT = 400; // REDUCED: When pruning, reduce to this number of nodes (was 750) 
-const CRITICAL_NODE_COUNT = 800; // REDUCED: Critical threshold (was 800)
+// Hard cap on node count to prevent slowdown
+const MAX_NODES = 1000;
 
-// Constants to limit memory usage - hard limits that prevent display issues
-const HARD_LIMIT_NODES = 5000; // Absolute maximum before emergency trimming
-const HARD_LIMIT_CONNECTIONS = 4500; // Absolute maximum before emergency trimming
-
-// Target for keeping newest nodes/connections when pruning
-const KEEP_NEWEST_NODES = 1500;      // When pruning, keep this many newest nodes
-const KEEP_NEWEST_CONNECTIONS = 2000; // When pruning, keep this many newest connections
+// Emergency capacity stop for connections. Normal cleanup is lifetime-based
+// (see addFlowBatch) — this only exists to bound memory if lifetimes are set
+// absurdly long. Must stay far above the lifetime-window working set (~5-25k
+// at firehose rates) or it mass-evicts visible connections and causes flashes.
+const EMERGENCY_MAX_CONNECTIONS = 30000;
 
 // Reuse positions for nodes with same IDs to prevent constant repositioning
 const nodePositionCache = new Map<string, {x: number, y: number}>();
+
+const FLOW_WEIGHT_DECAY_SECONDS = 3;
+
+const getConnectionWeight = (packetCount = 1, byteCount = 0): number => {
+  const packetScore = Math.log1p(packetCount) / Math.log(16);
+  const byteScore = Math.log1p(byteCount / 512) / Math.log(16);
+  return Math.max(0.25, Math.min(10, 0.5 + packetScore + byteScore));
+};
 
 // Helper function to generate random positions within the window bounds
 const generateRandomPosition = () => {
@@ -176,91 +182,48 @@ const checkMemoryUsage = (): boolean => {
   return isHighMemory;
 };
 
-// Helper function to prune oldest nodes when approaching limits
-const pruneOldestNodes = (nodes: Node[]): Node[] => {
-  if (nodes.length <= PRUNE_TO_COUNT) return nodes;
-  
-  logger.log(`Pruning nodes from ${nodes.length} to ${PRUNE_TO_COUNT}`);
-  
+// Helper function to prune oldest nodes when approaching limits.
+// Trims to just below the cap — cutting deep (1000 -> 400) removes nodes that
+// are still on screen and causes visible flashes.
+const pruneOldestNodes = (nodes: Node[], targetCount: number = Math.floor(MAX_NODES * 0.9)): Node[] => {
+  if (nodes.length <= targetCount) return nodes;
+
+  logger.log(`Pruning nodes from ${nodes.length} to ${targetCount}`);
+
   // Sort nodes by last active time (oldest first)
   const sortedNodes = [...nodes].sort((a, b) => a.lastActive - b.lastActive);
-  
+
   // Keep only the most recently active nodes
-  return sortedNodes.slice(nodes.length - PRUNE_TO_COUNT);
+  return sortedNodes.slice(nodes.length - targetCount);
 };
 
-// Helper function for aggressive pruning during critical node counts
-const forcePruneNodes = (nodes: Node[]): Node[] => {
-  // Even more aggressive pruning
-  const targetCount = Math.min(PRUNE_TO_COUNT, Math.floor(CRITICAL_NODE_COUNT * 0.75));
-  
-  // Keep only the most important nodes - prioritize:
-  // 1. IP address nodes (containing dots)
-  // 2. Most recently active nodes
-  
-  // First identify IP nodes
-  const ipNodes = nodes.filter(node => node.label?.includes('.') || node.id.includes('.'));
-  const otherNodes = nodes.filter(node => !(node.label?.includes('.') || node.id.includes('.')));
-  
-  // Sort both arrays by activity time
-  const sortedIpNodes = [...ipNodes].sort((a, b) => b.lastActive - a.lastActive);
-  const sortedOtherNodes = [...otherNodes].sort((a, b) => b.lastActive - a.lastActive);
-  
-  // Take most recent IP nodes, then fill remaining slots with other nodes
-  const keptIpNodes = sortedIpNodes.slice(0, Math.min(sortedIpNodes.length, targetCount * 0.6));
-  const remainingSlots = targetCount - keptIpNodes.length;
-  const keptOtherNodes = sortedOtherNodes.slice(0, Math.min(sortedOtherNodes.length, remainingSlots));
-  
-  return [...keptIpNodes, ...keptOtherNodes];
-};
-
-// Helper function to prune oldest connections
-const pruneOldestConnections = (connections: Connection[]): Connection[] => {
-  const targetCount = PRUNE_TO_COUNT * 3; // INCREASED: Allow 3x more connections than nodes
-  
+// Helper function to prune oldest connections. Trims gently to just below the
+// cap — mass cliffs (e.g. 5000 -> 1200) evict connections that are still on
+// screen and show up as render flashes.
+const pruneOldestConnections = (connections: Connection[], targetCount: number): Connection[] => {
   if (connections.length <= targetCount) return connections;
-  
+
   // Sort by last active time (oldest first)
   const sortedConnections = [...connections].sort((a, b) => a.lastActive - b.lastActive);
-  
+
   // Keep only the most recently active connections
   return sortedConnections.slice(connections.length - targetCount);
 };
 
-// Check for collisions between two nodes
-function checkCollision(node1: Node, node2: Node, minDistance: number): boolean {
-  if (!node1 || !node2 || node1.x === undefined || node1.y === undefined || node2.x === undefined || node2.y === undefined) {
-    return false;
-  }
-  const dx = node1.x - node2.x;
-  const dy = node1.y - node2.y;
-  const distance = Math.sqrt(dx * dx + dy * dy);
-  return distance < minDistance;
-}
 
 // Create store
 export const useNetworkStore = create<NetworkState>((set, get) => ({
   nodes: [],
   connections: [],
   
-  // DIRECT method to update node activity - bypasses batching
+  // Mutate lastActive in place — no set() means no React re-render on every packet.
+  // The renderer reads via getState() every 500ms, so it will pick up the change.
   updateNodeActivity: (nodeId: string, port?: number) => {
-    const now = Date.now();
-    set((state) => {
-      const nodeIndex = state.nodes.findIndex(n => n.id === nodeId);
-      if (nodeIndex !== -1) {
-        const updatedNodes = [...state.nodes];
-        const existingNode = updatedNodes[nodeIndex];
-        const updatedPorts = new Set(existingNode.ports);
-        if (port) {
-          updatedPorts.add(port);
-        }
-        updatedNodes[nodeIndex] = { ...existingNode, lastActive: now, ports: updatedPorts };
-        logger.log(`⚡ DIRECT UPDATE: ${nodeId} lastActive updated to ${now}`);
-        return { ...state, nodes: updatedNodes };
-      }
-      return state;
-    });
+    const node = get().nodes.find(n => n.id === nodeId);
+    if (node) {
+      node.lastActive = Date.now();
+      if (port !== undefined) node.ports.add(port);
+    }
   },
   
   // Add or update a node (replace if exists)
@@ -312,37 +275,116 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     useNetworkStore.getState().addOrUpdateNode(node);
   },
   
-  // Add or update a connection (replace if exists)
+  // Add or update a connection.
+  // Existing connections mutate lastActive in place (no set() = no re-render per packet).
+  // New connections call set() so subscribers see the structural change.
   addOrUpdateConnection: throttle((connection: Connection) => {
-    set((state) => {
-      const connectionIndex = state.connections.findIndex(
-        (c) => c.id === connection.id
-      );
-      
-      if (connectionIndex !== -1) {
-        // Update existing connection
-        const updatedConnections = [...state.connections];
-        const existingConnection = updatedConnections[connectionIndex];
-        // Smart merge: preserve port numbers if the new packet doesn't have them
-        updatedConnections[connectionIndex] = {
-          ...existingConnection,
+    const existing = get().connections.find(c => c.id === connection.id);
+    if (existing) {
+      const elapsed = Math.max(0, connection.lastActive - existing.lastActive) / 1000;
+      const decay = Math.exp(-elapsed / FLOW_WEIGHT_DECAY_SECONDS);
+      const packetCount = (existing.packetCount ?? 1) * decay + (connection.packetCount ?? 1);
+      const byteCount = (existing.byteCount ?? 0) * decay + (connection.byteCount ?? connection.size ?? 0);
+      existing.lastActive = connection.lastActive;
+      if (connection.protocol) existing.protocol = connection.protocol;
+      if (connection.srcPort) existing.srcPort = connection.srcPort;
+      if (connection.dstPort) existing.dstPort = connection.dstPort;
+      existing.packetCount = packetCount;
+      existing.byteCount = byteCount;
+      existing.weight = getConnectionWeight(packetCount, byteCount);
+    } else {
+      set((state) => {
+        const nextConnection = {
           ...connection,
-          srcPort: connection.srcPort || existingConnection.srcPort,
-          dstPort: connection.dstPort || existingConnection.dstPort,
+          packetCount: connection.packetCount ?? 1,
+          byteCount: connection.byteCount ?? connection.size ?? 0,
+          weight: connection.weight ?? getConnectionWeight(connection.packetCount ?? 1, connection.byteCount ?? connection.size ?? 0),
         };
-        return { ...state, connections: updatedConnections };
-      } else {
-        // Add new connection (with pruning if needed)
-        if (state.connections.length > MAX_NODES * 3) {
-          // Keep connection count in check relative to node count (increased ratio)
-          const prunedConnections = pruneOldestConnections(state.connections);
-          return { ...state, connections: [...prunedConnections, connection] };
+        if (state.connections.length > EMERGENCY_MAX_CONNECTIONS) {
+          const prunedConnections = pruneOldestConnections(state.connections, Math.floor(EMERGENCY_MAX_CONNECTIONS * 0.9));
+          return { ...state, connections: [...prunedConnections, nextConnection] };
         }
-        return { ...state, connections: [...state.connections, connection] };
-      }
-    });
-  }, 10), // Throttle to 10ms
+        return { ...state, connections: [...state.connections, nextConnection] };
+      });
+    }
+  }, 10),
   
+  // Atomically add/update a batch of src-node + dst-node + connection triples.
+  // A single set() call ensures nodes and their connections always land together,
+  // preventing the orphan-node window caused by independent per-call throttles.
+  addFlowBatch: (flows) => {
+    if (flows.length === 0) return;
+    set((state) => {
+      const nodeById = new Map<string, Node>(state.nodes.map(n => [n.id, n]));
+      const connById = new Map<string, Connection>(state.connections.map(c => [c.id, c]));
+
+      flows.forEach(({ src, dst, conn }) => {
+        const eSrc = nodeById.get(src.id);
+        if (eSrc) {
+          eSrc.lastActive = src.lastActive;
+          src.ports?.forEach(p => eSrc.ports.add(p));
+        } else {
+          nodeById.set(src.id, { ...src, ports: new Set(src.ports) });
+        }
+
+        const eDst = nodeById.get(dst.id);
+        if (eDst) {
+          eDst.lastActive = dst.lastActive;
+          dst.ports?.forEach(p => eDst.ports.add(p));
+        } else {
+          nodeById.set(dst.id, { ...dst, ports: new Set(dst.ports) });
+        }
+
+        const eConn = connById.get(conn.id);
+        if (eConn) {
+          const elapsed = Math.max(0, conn.lastActive - eConn.lastActive) / 1000;
+          const decay = Math.exp(-elapsed / FLOW_WEIGHT_DECAY_SECONDS);
+          const packetCount = (eConn.packetCount ?? 1) * decay + (conn.packetCount ?? 1);
+          const byteCount = (eConn.byteCount ?? 0) * decay + (conn.byteCount ?? conn.size ?? 0);
+          eConn.lastActive = conn.lastActive;
+          if (conn.protocol) eConn.protocol = conn.protocol;
+          if (conn.srcPort) eConn.srcPort = conn.srcPort;
+          if (conn.dstPort) eConn.dstPort = conn.dstPort;
+          if (conn.packetColor) eConn.packetColor = conn.packetColor;
+          eConn.packetCount = packetCount;
+          eConn.byteCount = byteCount;
+          eConn.weight = getConnectionWeight(packetCount, byteCount);
+        } else {
+          const packetCount = conn.packetCount ?? 1;
+          const byteCount = conn.byteCount ?? conn.size ?? 0;
+          connById.set(conn.id, {
+            ...conn,
+            packetCount,
+            byteCount,
+            weight: conn.weight ?? getConnectionWeight(packetCount, byteCount),
+          });
+        }
+      });
+
+      let nodes = Array.from(nodeById.values());
+      let connections = Array.from(connById.values());
+
+      // Continuous lifetime-based expiry, run every flush (50 ms). This is the
+      // primary cleanup: it removes a handful of entries at a time, always ones
+      // the renderer has already finished fading (+2s buffer past the visual
+      // lifetime), so pruning is never visible. Capacity cliffs are what caused
+      // the render flashes — entries still on screen vanishing in bulk.
+      const now = Date.now();
+      const { connectionLifetime, nodeLifetime } = usePhysicsStore.getState();
+      const { isPined } = usePinStore.getState();
+      connections = connections.filter(c => now - c.lastActive <= connectionLifetime + 2000);
+      nodes = nodes.filter(n => now - n.lastActive <= nodeLifetime + 2000 || isPined(n.id));
+
+      // Emergency capacity stops only — gentle trims just below the cap.
+      if (nodes.length > MAX_NODES) nodes = pruneOldestNodes(nodes);
+      if (connections.length > EMERGENCY_MAX_CONNECTIONS) {
+        connections = pruneOldestConnections(connections, Math.floor(EMERGENCY_MAX_CONNECTIONS * 0.9));
+      }
+
+      return { nodes, connections };
+    });
+  },
+
   // COMPATIBILITY FUNCTION: Add connection (old API wrapper for addOrUpdateConnection)
   addConnection: (connection: Partial<Connection>) => {
     const now = Date.now();
@@ -401,23 +443,18 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   removeInactiveElements: () => {
     const now = Date.now();
     const { isPined } = usePinStore.getState();
-    
+    const { connectionLifetime, nodeLifetime } = usePhysicsStore.getState();
+
     set((state) => {
-      // Check if we're approaching critical node count
-      const isNearCritical = state.nodes.length >= MAX_NODES;
+      // Respect the user-configured lifetimes from the physics panel.
+      // Add a small buffer so the store never prunes before the layout engine does.
+      const connectionExpirationTime = connectionLifetime + 2000;
+      const nodeExpirationTime = nodeLifetime + 2000;
       
-      // Use shorter expiration times when we have many nodes
-      const nodeExpirationTime = isNearCritical 
-        ? NODE_EXPIRATION_TIME * 0.6 // More aggressive cleanup when we have many nodes
-        : NODE_EXPIRATION_TIME;
-        
-      const connectionExpirationTime = isNearCritical
-        ? CONNECTION_EXPIRATION_TIME * 0.6
-        : CONNECTION_EXPIRATION_TIME;
-      
-      // Always keep most recent connections and nodes regardless of activity
-      // This ensures recent activity is always visible
-      const PRESERVE_NEWEST_COUNT = 1500; // INCREASED: Always preserve 1500 newest nodes regardless of total count
+      // Preserve newest nodes up to the user's configured display limit.
+      // Using maxNodes from settings so cleanup respects the same cap as the renderer.
+      const maxNodes = useSettingsStore.getState().maxNodes;
+      const PRESERVE_NEWEST_COUNT = Math.floor(maxNodes * 0.8);
       
       // Sort nodes by activity time (most recent first)
       const sortedNodes = [...state.nodes].sort((a, b) => b.lastActive - a.lastActive);
@@ -426,28 +463,16 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       const preservedNodes = sortedNodes.slice(0, PRESERVE_NEWEST_COUNT);
       const olderNodes = sortedNodes.slice(PRESERVE_NEWEST_COUNT);
       
-      // Filter older nodes by activity (but only if we have way too many)
-      const activeOlderNodes = state.nodes.length > 2000 ? olderNodes.filter(
+      const activeOlderNodes = olderNodes.filter(
         (node) => now - node.lastActive < nodeExpirationTime || isPined(node.id)
-      ) : olderNodes; // Keep all older nodes if we're under 2000 total
+      );
       
       // Final node list is preserved + active older nodes
       const activeNodes = [...preservedNodes, ...activeOlderNodes];
       
-      // Sort connections by activity time (most recent first)
-      const sortedConnections = [...state.connections].sort((a, b) => b.lastActive - a.lastActive);
-      
-      // Keep newest connections regardless of activity, then filter older ones
-      const preservedConnections = sortedConnections.slice(0, PRESERVE_NEWEST_COUNT * 2); // More connections than nodes
-      const olderConnections = sortedConnections.slice(PRESERVE_NEWEST_COUNT * 2);
-      
-      // Filter older connections by activity (but only if we have way too many)
-      const activeOlderConnections = state.connections.length > 3000 ? olderConnections.filter(
+      const activeConnections = state.connections.filter(
         (connection) => now - connection.lastActive < connectionExpirationTime
-      ) : olderConnections; // Keep all older connections if we're under 3000 total
-      
-      // Final connection list is preserved + active older connections
-      const activeConnections = [...preservedConnections, ...activeOlderConnections];
+      );
       
       const nodesRemoved = state.nodes.length - activeNodes.length;
       if (nodesRemoved > 0) {
@@ -541,37 +566,6 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     };
   },
 
-  // Reposition overlapping nodes to prevent visual collisions
-  repositionOverlappingNodes: () => {
-    // Use the shared nodeSpacing constant from the physics store
-    const { nodeSpacing } = usePhysicsStore.getState();
-    const minDistance = nodeSpacing;
-
-    const allNodes = new Map<string, Node>();
-    get().nodes.forEach(node => {
-      allNodes.set(node.id, node);
-    });
-
-    let repositioned = 0;
-
-    allNodes.forEach(node => {
-      // Check for collisions with other nodes
-      allNodes.forEach(otherNode => {
-        if (node.id !== otherNode.id && checkCollision(node, otherNode, minDistance)) {
-          // Simple repositioning: move the current node slightly
-          const angle = Math.random() * 2 * Math.PI;
-          if (node.x !== undefined && node.y !== undefined) {
-            node.x += Math.cos(angle) * (minDistance / 2);
-            node.y += Math.sin(angle) * (minDistance / 2);
-            repositioned++;
-          }
-        }
-      });
-    });
-
-    if (repositioned > 0) {
-      set({ nodes: Array.from(allNodes.values()) });
-      logger.log(`🔧 Repositioned ${repositioned} overlapping nodes (${minDistance}px shared threshold)`);
-    }
-  }
+  // Positions now owned by useGraphLayout — this is a no-op kept for interface compatibility
+  repositionOverlappingNodes: () => {}
 }));

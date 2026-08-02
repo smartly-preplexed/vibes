@@ -220,12 +220,12 @@ export const UnifiedDebugPanel: React.FC<UnifiedDebugPanelProps> = ({
         right: '10px',
         zIndex: 1001,
         background: 'rgba(0, 0, 0, 0.9)',
-        border: '1px solid #00ff00',
+        border: '1px solid var(--vibes-primary, #00ff00)',
         borderRadius: '4px',
         padding: '8px 12px',
         fontFamily: 'monospace',
         fontSize: '12px',
-        color: '#00ff00',
+        color: 'var(--vibes-primary, #00ff00)',
         cursor: 'pointer'
       }} onClick={() => setIsMinimized(false)}>
         🔧 Debug Panel (Click to expand)
@@ -240,11 +240,11 @@ export const UnifiedDebugPanel: React.FC<UnifiedDebugPanelProps> = ({
       right: '10px',
       zIndex: 1001,
       background: 'rgba(0, 0, 0, 0.95)',
-      border: '1px solid #00ff00',
+      border: '1px solid var(--vibes-primary, #00ff00)',
       borderRadius: '6px',
       fontFamily: 'monospace',
       fontSize: '11px',
-      color: '#00ff00',
+      color: 'var(--vibes-primary, #00ff00)',
       width: '400px',
       maxHeight: '80vh',
       overflow: 'hidden',
@@ -256,16 +256,16 @@ export const UnifiedDebugPanel: React.FC<UnifiedDebugPanelProps> = ({
         justifyContent: 'space-between',
         alignItems: 'center',
         padding: '8px 12px',
-        borderBottom: '1px solid #00ff00',
-        background: 'rgba(0, 255, 0, 0.1)'
+        borderBottom: '1px solid var(--vibes-primary, #00ff00)',
+        background: 'rgba(var(--vibes-primary-rgb, 0, 255, 0),0.1)'
       }}>
-        <span style={{ fontWeight: 'bold', color: '#00ff00' }}>🔧 Debug Panel</span>
+        <span style={{ fontWeight: 'bold', color: 'var(--vibes-primary, #00ff00)' }}>🔧 Debug Panel</span>
         <button
           onClick={() => setIsMinimized(true)}
           style={{
             background: 'none',
-            border: '1px solid #00ff00',
-            color: '#00ff00',
+            border: '1px solid var(--vibes-primary, #00ff00)',
+            color: 'var(--vibes-primary, #00ff00)',
             cursor: 'pointer',
             borderRadius: '2px',
             padding: '2px 6px',
@@ -288,9 +288,9 @@ export const UnifiedDebugPanel: React.FC<UnifiedDebugPanelProps> = ({
             style={{
               flex: 1,
               padding: '8px 4px',
-              background: activeTab === tab.id ? 'rgba(0, 255, 0, 0.2)' : 'transparent',
+              background: activeTab === tab.id ? 'rgba(var(--vibes-primary-rgb, 0, 255, 0),0.2)' : 'transparent',
               border: 'none',
-              color: activeTab === tab.id ? '#00ff00' : '#666',
+              color: activeTab === tab.id ? 'var(--vibes-primary, #00ff00)' : '#666',
               cursor: 'pointer',
               fontSize: '9px',
               borderRight: '1px solid #333'
@@ -342,7 +342,7 @@ export const UnifiedDebugPanel: React.FC<UnifiedDebugPanelProps> = ({
               </span>
             </div>
             
-            <div style={{ marginTop: '8px', marginBottom: '4px', color: '#00ff00' }}>
+            <div style={{ marginTop: '8px', marginBottom: '4px', color: 'var(--vibes-primary, #00ff00)' }}>
               📡 Store Status:
             </div>
             <div style={{ marginBottom: '4px' }}>
@@ -396,8 +396,8 @@ export const UnifiedDebugPanel: React.FC<UnifiedDebugPanelProps> = ({
                   width: '80px', 
                   marginLeft: '8px',
                   background: 'black',
-                  color: '#00ff00',
-                  border: '1px solid #00ff00',
+                  color: 'var(--vibes-primary, #00ff00)',
+                  border: '1px solid var(--vibes-primary, #00ff00)',
                   padding: '2px 4px'
                 }}
               />
@@ -416,8 +416,8 @@ export const UnifiedDebugPanel: React.FC<UnifiedDebugPanelProps> = ({
                   width: '80px', 
                   marginLeft: '8px',
                   background: 'black',
-                  color: '#00ff00',
-                  border: '1px solid #00ff00',
+                  color: 'var(--vibes-primary, #00ff00)',
+                  border: '1px solid var(--vibes-primary, #00ff00)',
                   padding: '2px 4px'
                 }}
               />
@@ -427,8 +427,8 @@ export const UnifiedDebugPanel: React.FC<UnifiedDebugPanelProps> = ({
               <div style={{
                 marginTop: '12px',
                 padding: '8px',
-                background: 'rgba(0, 255, 0, 0.1)',
-                border: '1px solid #00ff00',
+                background: 'rgba(var(--vibes-primary-rgb, 0, 255, 0),0.1)',
+                border: '1px solid var(--vibes-primary, #00ff00)',
                 borderRadius: '4px'
               }}>
                 <div>🧪 Performance Test Active</div>
@@ -553,7 +553,7 @@ export const UnifiedDebugPanel: React.FC<UnifiedDebugPanelProps> = ({
                   alignItems: 'center', 
                   cursor: 'pointer',
                   padding: '4px',
-                  backgroundColor: currentRenderer === renderer.key ? 'rgba(0, 255, 0, 0.2)' : 'transparent',
+                  backgroundColor: currentRenderer === renderer.key ? 'rgba(var(--vibes-primary-rgb, 0, 255, 0),0.2)' : 'transparent',
                   borderRadius: '2px'
                 }}>
                   <input

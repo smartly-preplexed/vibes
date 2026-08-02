@@ -256,3 +256,7 @@ docs/generated/
 *.bak
 *.backup
 *.orig 
+*.tgz
+
+# Local testing harness (headless-browser layout verification, not committed)
+testing/

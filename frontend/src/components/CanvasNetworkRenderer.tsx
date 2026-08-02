@@ -1,1096 +1,300 @@
-import React, { useEffect, useRef, useCallback, useMemo } from 'react'
-import { useNetworkStore } from '../stores/networkStore'
-import { usePacketStore } from '../stores/packetStore'
-import { useSizeStore } from '../stores/sizeStore'
-import { useSettingsStore } from '../stores/settingsStore'
-import { usePhysicsStore } from '../stores/physicsStore'
-import { usePinStore } from '../stores/pinStore'
-import { logger } from '../utils/logger'
-import { useWhyDidYouUpdate } from '../hooks/useWhyDidYouUpdate'
+import React, { useEffect, useRef, useCallback } from 'react';
+import { useSizeStore } from '../stores/sizeStore';
+import { useGraphLayout, WORLD_SCALE, camera } from '../hooks/useGraphLayout';
+import { useThemeStore, subnetNodeColor, edgeColor, Theme } from '../stores/themeStore';
 
-// Color utility functions for enhanced node coloring
-function hexToRgb(hex: string): {r: number, g: number, b: number} | null {
-  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  return result ? {
-    r: parseInt(result[1], 16),
-    g: parseInt(result[2], 16),
-    b: parseInt(result[3], 16)
-  } : null;
-}
+// Start zoomed out so the whole (larger-than-viewport) world fits, leaving real
+// room to zoom in. zoom = 1/WORLD_SCALE with pan (0,0) maps world → viewport 1:1.
+const FIT_ZOOM = 1 / WORLD_SCALE;
 
-function rgbToHex(r: number, g: number, b: number): string {
-  return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
-}
-
-function hslToHex(h: number, s: number, l: number): string {
-  h /= 360;
-  s /= 100;
-  l /= 100;
-  
-  const c = (1 - Math.abs(2 * l - 1)) * s;
-  const x = c * (1 - Math.abs((h * 6) % 2 - 1));
-  const m = l - c / 2;
-  let r = 0, g = 0, b = 0;
-  
-  if (0 <= h && h < 1/6) {
-    r = c; g = x; b = 0;
-  } else if (1/6 <= h && h < 2/6) {
-    r = x; g = c; b = 0;
-  } else if (2/6 <= h && h < 3/6) {
-    r = 0; g = c; b = x;
-  } else if (3/6 <= h && h < 4/6) {
-    r = 0; g = x; b = c;
-  } else if (4/6 <= h && h < 5/6) {
-    r = x; g = 0; b = c;
-  } else if (5/6 <= h && h < 1) {
-    r = c; g = 0; b = x;
-  }
-  
-  r = Math.round((r + m) * 255);
-  g = Math.round((g + m) * 255);
-  b = Math.round((b + m) * 255);
-  
-  return rgbToHex(r, g, b);
-}
-
-function getProtocolColor(protocol?: string): string {
-  if (!protocol) return '#CCCCCC'; // Default color for unknown protocols
-
-  switch (protocol.toLowerCase()) {
-    case 'tcp':
-      return '#00FF00'; // Green
-    case 'udp':
-      return '#FF00FF'; // Magenta
-    case 'icmp':
-      return '#00FFFF'; // Cyan
-    case 'http':
-    case 'https':
-      return '#FFA500'; // Orange
-    default:
-      return '#FFFFFF'; // White for other protocols
-  }
-}
-
-function lerp(start: number, end: number, amt: number): number {
-  return (1 - amt) * start + amt * end
-}
-
-
-// Generate packet-based color for connections
-function getPacketColor(sourceIp: string, targetIp: string, protocol?: string): string {
-  // Create a unique identifier from the packet's source and destination
-  const packetId = `${sourceIp}-${targetIp}`;
-  
-  // Generate a hash from the packet identifier
-  let hash = 0;
-  for (let i = 0; i < packetId.length; i++) {
-    hash = ((hash << 5) - hash) + packetId.charCodeAt(i);
-    hash = hash & hash;
-  }
-  
-  // Extract RGB components from hash
-  const r = Math.abs(hash) % 256;
-  const g = Math.abs(hash >> 8) % 256;
-  const b = Math.abs(hash >> 16) % 256;
-  
-  // Ensure colors are bright and vibrant for visibility
-  const minBrightness = 100;
-  const adjustedR = Math.max(minBrightness, r);
-  const adjustedG = Math.max(minBrightness, g);
-  const adjustedB = Math.max(minBrightness, b);
-  
-  // Add protocol-based hue shift for variety
-  let hueShift = 0;
-  if (protocol) {
-    switch (protocol.toLowerCase()) {
-      case 'tcp': hueShift = 30; break;
-      case 'udp': hueShift = 60; break;
-      case 'icmp': hueShift = 90; break;
-      case 'http': hueShift = 120; break;
-      case 'https': hueShift = 150; break;
-      default: hueShift = 0; break;
-    }
-  }
-  
-  // Convert to HSL, adjust hue, convert back to RGB
-  const max = Math.max(adjustedR, adjustedG, adjustedB);
-  const min = Math.min(adjustedR, adjustedG, adjustedB);
-  const diff = max - min;
-  
-  let h = 0;
-  if (diff !== 0) {
-    if (max === adjustedR) h = ((adjustedG - adjustedB) / diff) % 6;
-    else if (max === adjustedG) h = (adjustedB - adjustedR) / diff + 2;
-    else h = (adjustedR - adjustedG) / diff + 4;
-  }
-  h = Math.round(60 * h);
-  if (h < 0) h += 360;
-  
-  // Apply hue shift
-  h = (h + hueShift) % 360;
-  
-  // High saturation and lightness for vibrant colors
-  const s = 85; // High saturation
-  const l = 60; // Good lightness for visibility
-  
-  return hslToHex(h, s, l);
-}
-
-// Types for our renderer
-interface RenderedNode {
-  id: string
-  x: number
-  y: number
-  vx: number // Velocity X
-  vy: number // Velocity Y
-  radius: number
-  color: string
-  highlightColor: string
-  alpha: number
-  lastActive: number
-  isDriftingAway: boolean // State for drifting behavior
-}
-
-interface RenderedConnection {
-  alpha: number
-  color: string
-  protocol?: string
-  dstPort?: number
-  lastActive: number
-  sourceId: string
-  targetId: string
-}
-
-interface Viewport {
-  x: number
-  y: number
-  zoom: number
-  width: number
-  height: number
-}
-
-// Object pool for performance
-class ObjectPool<T> {
-  private pool: T[] = []
-  private createFn: () => T
-  private resetFn: (obj: T) => void
-
-  constructor(createFn: () => T, resetFn: (obj: T) => void, initialSize = 100) {
-    this.createFn = createFn
-    this.resetFn = resetFn
-    
-    // Pre-populate pool
-    for (let i = 0; i < initialSize; i++) {
-      this.pool.push(createFn())
-    }
-  }
-
-  acquire(): T {
-    return this.pool.pop() || this.createFn()
-  }
-
-  release(obj: T): void {
-    this.resetFn(obj)
-    this.pool.push(obj)
-  }
-}
-
-// High-performance Canvas Network Renderer
 export const CanvasNetworkRenderer: React.FC = React.memo(() => {
+  const canvasRef    = useRef<HTMLCanvasElement>(null);
+  const animationRef = useRef<number>();
+  // Pan/zoom/viewport live in the shared module `camera` so the layout can read
+  // them to dock pinned nodes in fixed screen space.
+  const viewportRef  = useRef(camera);
+  const frameCount   = useRef(0);
+  const lastFpsTime  = useRef(0);
+  const fpsRef       = useRef(0);
 
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const animationRef = useRef<number>()
-  const lastFrameTime = useRef<number>(0)
-  const fpsRef = useRef<number>(0)
-  const frameCount = useRef<number>(0)
-  const lastLogTime = useRef<number>(0)
-  
-  // Viewport state
-  const viewportRef = useRef<Viewport>({
-    x: 0,
-    y: 0,
-    zoom: 1.0, 
-    width: 0,
-    height: 0
-  })
+  const { width, height } = useSizeStore();
+  const { layoutNodes, layoutEdges, tick } = useGraphLayout();
 
-  // Store hooks
-  const { nodes, connections } = useNetworkStore()
-  const { packets } = usePacketStore()
-  const { height, width } = useSizeStore()
-  const { verboseLogging } = useSettingsStore()
-  const { isPined } = usePinStore()
-  const { nodeSpacing } = usePhysicsStore()
-  const {
-    connectionPullStrength,
-    collisionRepulsion,
-    damping,
-    connectionLifetime,
-    driftAwayStrength,
-  } = usePhysicsStore()
-
-  console.log('--- CanvasNetworkRenderer RE-RENDER ---');
-  useWhyDidYouUpdate('CanvasNetworkRenderer', { nodes, connections, height, width, verboseLogging, nodeSpacing, connectionPullStrength, collisionRepulsion, damping, connectionLifetime, driftAwayStrength });
-
-  const pinnedNodePositions = useRef<Map<string, {x: number, y: number}>>(new Map());
-  const PINNED_PULL_SCALING = 0.0005;
-
-
-  // Object pools
-  const nodePool = useMemo(() => new ObjectPool<RenderedNode>(
-    () => ({ id: '', x: 0, y: 0, vx: 0, vy: 0, radius: 0, color: '', highlightColor: '', alpha: 0, lastActive: 0, isDriftingAway: false }),
-    (node) => { node.id = ''; node.alpha = 0; node.lastActive = 0; node.isDriftingAway = false }
-  ), [])
-
-  const connectionPool = useMemo(() => new ObjectPool<RenderedConnection>(
-    () => ({ alpha: 0, color: '', protocol: '', dstPort: 0, lastActive: 0, sourceId: '', targetId: '' }),
-    (conn) => { conn.alpha = 0; conn.lastActive = 0; conn.color = ''; conn.protocol = ''; conn.dstPort = 0; conn.sourceId = ''; conn.targetId = '' }
-  ), [])
-
-  // Active rendered objects
-  const activeNodes = useRef<Map<string, RenderedNode>>(new Map())
-  const activeConnections = useRef<RenderedConnection[]>([])
-  const nodePositions = useRef<Map<string, {x: number, y: number}>>(new Map())
-
-
-
-  // Update viewport size and center it
+  // Active theme read per-frame via a ref so switching recolors instantly
+  // with zero React re-renders in the render loop.
+  const themeRef = useRef<Theme>(useThemeStore.getState().theme);
   useEffect(() => {
-    if (canvasRef.current && width && height) {
-      const canvas = canvasRef.current;
-      const dpr = window.devicePixelRatio || 1;
+    themeRef.current = useThemeStore.getState().theme;
+    return useThemeStore.subscribe(s => { themeRef.current = s.theme; });
+  }, []);
 
-      // Set actual size
-      canvas.width = width * dpr;
-      canvas.height = height * dpr;
-      canvas.style.width = `${width}px`;
-      canvas.style.height = `${height}px`;
-
-      // Update viewport dimensions
-      viewportRef.current.width = width;
-      viewportRef.current.height = height;
-
-      // Center the viewport only on the initial load, accounting for zoom
-      if (viewportRef.current.x === 0 && viewportRef.current.y === 0) {
-        viewportRef.current.x = (width - width / viewportRef.current.zoom) / 2;
-        viewportRef.current.y = (height - height / viewportRef.current.zoom) / 2;
-      }
-      
-      // Scale context for high DPI
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.scale(dpr, dpr);
-      }
-    }
+  // ── Canvas resize ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!canvasRef.current || !width || !height) return;
+    const canvas = canvasRef.current;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width  = width  * dpr;
+    canvas.height = height * dpr;
+    canvas.style.width  = `${width}px`;
+    canvas.style.height = `${height}px`;
+    viewportRef.current.width  = width;
+    viewportRef.current.height = height;
+    const ctx = canvas.getContext('2d');
+    if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }, [width, height]);
 
-  // Viewport culling - only render visible objects
-  const isInViewport = useCallback((x: number, y: number, radius = 10): boolean => {
-    const vp = viewportRef.current
-    const margin = radius * 2
-    
-    return (
-      x >= vp.x - margin && 
-      x <= vp.x + vp.width / vp.zoom + margin &&
-      y >= vp.y - margin && 
-      y <= vp.y + vp.height / vp.zoom + margin
-    )
-  }, [])
+  // ── Render loop ─────────────────────────────────────────────────────────────
+  const render = useCallback((now: number) => {
+    // Advance physics first — one RAF drives everything
+    tick(now);
 
-  // Generate stable positions for nodes based on IP address
-  const generatePosition = useCallback((nodeId: string): {x: number, y: number} => {
-    if (nodePositions.current.has(nodeId)) {
-      return nodePositions.current.get(nodeId)!
+    const canvas = canvasRef.current;
+    const vp     = viewportRef.current;
+    if (!canvas || !vp.width || !vp.height) {
+      animationRef.current = requestAnimationFrame(render);
+      return;
+    }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // FPS counter
+    frameCount.current++;
+    if (now - lastFpsTime.current >= 1000) {
+      fpsRef.current     = frameCount.current;
+      frameCount.current = 0;
+      lastFpsTime.current = now;
     }
 
-    // IP-based positioning for network topology visualization
-    if (nodeId.includes('.')) {
-      // Parse IP address for intelligent positioning
-      const parts = nodeId.split('.').map(Number)
-      if (parts.length === 4 && parts.every(p => !isNaN(p) && p >= 0 && p <= 255)) {
-        // Much more spread out positioning based on IP structure
-        const firstOctet = parts[0]
-        const secondOctet = parts[1] 
-        const thirdOctet = parts[2]
-        const fourthOctet = parts[3]
-        
-        // Create major regions based on first octet (10.x, 172.x, 192.x, etc.)
-        let regionX = 0
-        let regionY = 0
-        
-        if (firstOctet === 192) {
-          regionX = 200 + secondOctet * 4 // 192.168.x -> spread horizontally
-          regionY = 150
-        } else if (firstOctet === 10) {
-          regionX = 500 + secondOctet * 3 // 10.x.x -> different region
-          regionY = 300
-        } else if (firstOctet === 172) {
-          regionX = 800 + (secondOctet - 16) * 5 // 172.16-31.x -> another region
-          regionY = 200
-        } else {
-          // Other ranges spread out more
-          regionX = 100 + (firstOctet % 20) * 50
-          regionY = 400 + (firstOctet % 10) * 40
-        }
-        
-        // Add variation based on 3rd and 4th octets
-        const spreadX = (thirdOctet * 2) + (fourthOctet % 50) - 25 // More spread
-        const spreadY = (fourthOctet * 1.5) + (thirdOctet % 40) - 20
-        
-        // Final position with bounds checking
-        const x = Math.max(50, Math.min(1400, regionX + spreadX))
-        const y = Math.max(50, Math.min(800, regionY + spreadY))
-        
-        const position = { x, y }
-        nodePositions.current.set(nodeId, position)
-        return position
-      }
-    }
+    const theme = themeRef.current;
 
-    // Fallback to hash-based positioning for non-IP nodes
-    let hash = 0
-    for (let i = 0; i < nodeId.length; i++) {
-      const char = nodeId.charCodeAt(i)
-      hash = ((hash << 5) - hash) + char
-      hash = hash & hash
-    }
+    // Clear to the theme background
+    ctx.fillStyle = theme.background;
+    ctx.fillRect(0, 0, vp.width, vp.height);
 
-    const x = 200 + (Math.abs(hash) % 800)
-    const y = 150 + (Math.abs(hash >> 8) % 500)
-    
-    const position = { x, y }
-    nodePositions.current.set(nodeId, position)
-    return position
-  }, [])
+    ctx.save();
+    ctx.translate(-vp.x * vp.zoom, -vp.y * vp.zoom);
+    ctx.scale(vp.zoom, vp.zoom);
 
-  // Update rendered objects from store data
-  const updateRenderObjects = useCallback(() => {
-    const now = Date.now()
-    const activeAge = 30000 // 30 seconds for "active" state
+    const nodes = layoutNodes.current;
+    const edges = layoutEdges.current;
 
-    const storeNodesById = new Map(nodes.map(n => [n.id, n]));
-    const currentRenderedNodeIds = new Set(activeNodes.current.keys());
-
-    // Remove nodes that are no longer in the store
-    for (const nodeId of currentRenderedNodeIds) {
-      if (!storeNodesById.has(nodeId)) {
-        const nodeToRelease = activeNodes.current.get(nodeId);
-        if (nodeToRelease) {
-          nodePool.release(nodeToRelease);
-        }
-        activeNodes.current.delete(nodeId);
-      }
-    }
-
-    // Add new nodes or update existing ones
-    storeNodesById.forEach((node, nodeId) => {
-      const existingNode = activeNodes.current.get(nodeId);
-      if (existingNode) {
-        // Update existing node
-        existingNode.lastActive = node.lastActive;
-        const isActive = (now - node.lastActive) < activeAge;
-        existingNode.radius = isActive ? 10 : 6;
-        if (existingNode.isDriftingAway && isActive) {
-          existingNode.isDriftingAway = false;
-        }
-
-      } else {
-        // Add new node - place it randomly around the center up to 500px away
-        const centerX = viewportRef.current.width / 2;
-        const centerY = viewportRef.current.height / 2;
-        const angle = Math.random() * 2 * Math.PI;
-        const radius = 500 + Math.random() * 300; // Spawn between 500 and 800px radius
-        
-        const position = {
-          x: centerX + Math.cos(angle) * radius,
-          y: centerY + Math.sin(angle) * radius,
-        };
-        const renderedNode = nodePool.acquire();
-        renderedNode.id = node.id;
-        renderedNode.x = position.x;
-        renderedNode.y = position.y;
-        renderedNode.vx = 0;
-        renderedNode.vy = 0;
-        renderedNode.isDriftingAway = false;
-        renderedNode.lastActive = node.lastActive;
-        const age = now - node.lastActive;
-        const isActive = age < activeAge;
-        
-        const latestConnection = connections
-          .filter(c => c.source === node.id || c.target === node.id)
-          .sort((a, b) => b.lastActive - a.lastActive)[0];
-
-        renderedNode.color = getProtocolColor(latestConnection?.protocol);
-
-        let highlightColor = '#00ff41'; // Default green
-        if (node.id.includes('.')) {
-          const parts = node.id.split('.').map(Number);
-          if (parts.length === 4 && parts.every(p => !isNaN(p) && p >= 0 && p <= 255)) {
-            const [firstOctet] = parts;
-            if (firstOctet === 192) {
-              highlightColor = '#0080ff'; // Blue for home networks
-            } else if (firstOctet === 10) {
-              highlightColor = '#ff00ff'; // Magenta for corporate
-            } else if (firstOctet === 172) {
-              highlightColor = '#ff4500'; // Orange for other private
-            } else if (firstOctet === 8 || firstOctet === 1) {
-              highlightColor = '#ffff00'; // Yellow for public DNS
-            }
-          }
-        } else {
-          let hash = 0;
-          for (let i = 0; i < node.id.length; i++) {
-            hash = ((hash << 5) - hash) + node.id.charCodeAt(i);
-            hash = hash & hash;
-          }
-          const hue = Math.abs(hash) % 360;
-          highlightColor = hslToHex(hue, 90, 60);
-        }
-        
-        renderedNode.highlightColor = highlightColor;
-        renderedNode.alpha = Math.max(0.4, 1 - (age / 600000));
-        activeNodes.current.set(nodeId, renderedNode);
-      }
+    const edgeDegree = new Map<string, number>();
+    const connectedIds = new Set<string>();
+    edges.forEach(edge => {
+      if (edge.alpha <= 0) return;
+      connectedIds.add(edge.sourceId);
+      connectedIds.add(edge.targetId);
+      edgeDegree.set(edge.sourceId, (edgeDegree.get(edge.sourceId) ?? 0) + 1);
+      edgeDegree.set(edge.targetId, (edgeDegree.get(edge.targetId) ?? 0) + 1);
     });
 
+    // ── Draw edges ──────────────────────────────────────────────────────────
+    // Budget for port labels shown at the zoomed-out overview (interesting
+    // edges only) so scan ports read without diving all the way in.
+    let portLabels = 0;
+    const portLabelBoxes: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
+    edges.forEach(edge => {
+      const src = nodes.get(edge.sourceId);
+      const tgt = nodes.get(edge.targetId);
+      if (!src || !tgt || edge.alpha <= 0) return;
 
-    // Process connections
-    const nodeIds = new Set(Array.from(activeNodes.current.keys()))
-    const recentConnections = connections
-      .filter(conn => nodeIds.has(conn.source) && nodeIds.has(conn.target))
-      .slice(0, 5000)
+      const proto = edge.protocol?.toLowerCase() ?? '';
+      const degree = Math.max(edgeDegree.get(edge.sourceId) ?? 1, edgeDegree.get(edge.targetId) ?? 1);
+      const degreeAlpha = Math.max(0.5, Math.min(1, Math.sqrt(24 / degree)));
+      const weightBoost = Math.max(0.75, Math.min(1.4, Math.sqrt(edge.weight)));
+      const edgeAlpha = Math.min(1, edge.alpha * degreeAlpha * weightBoost);
+      const weightedWidth = Math.max(1, Math.min(4, 1 + Math.log1p(edge.weight)));
+      const lineWidth = proto === 'icmp' ? Math.max(1, weightedWidth - 0.75) : weightedWidth;
 
-    // Release all old connections
-    activeConnections.current.forEach(c => connectionPool.release(c));
-    activeConnections.current.length = 0;
+      ctx.strokeStyle = edgeColor(proto, edgeAlpha, theme);
+      ctx.lineWidth   = lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(src.x, src.y);
+      ctx.lineTo(tgt.x, tgt.y);
+      ctx.stroke();
 
-    recentConnections.forEach(conn => {
-      const sourceNode = activeNodes.current.get(conn.source)
-      const targetNode = activeNodes.current.get(conn.target)
-      
-      if (sourceNode && targetNode) {
-        const renderedConn = connectionPool.acquire()
-        renderedConn.color = conn.packetColor || getPacketColor(conn.source, conn.target, conn.protocol)
-        renderedConn.protocol = conn.protocol
-        renderedConn.dstPort = conn.dstPort;
-        const connectionAge = now - conn.lastActive;
-        renderedConn.alpha = Math.max(0, 1 - (connectionAge / connectionLifetime))
-        renderedConn.lastActive = conn.lastActive
-        renderedConn.sourceId = conn.source
-        renderedConn.targetId = conn.target
-        
-        activeConnections.current.push(renderedConn)
-      }
-    })
-
-  }, [nodes, connections, generatePosition, nodePool, connectionPool])
-
-  const updatePhysics = useCallback((deltaTime: number) => {
-    if (!width || !height) return;
-
-    // --- Physics Constants ---
-    // These factors scale the user-friendly values from the store 
-    // into numbers that work well with the physics simulation.
-    const PULL_SCALING = 0.001;
-    const REPULSION_SCALING = 0.03; // Increased to prevent node overlap
-//   const DRIFT_AWAY_SCALING = 0.000001;
-    const INACTIVE_REMOVAL_SECONDS = 6000;
-    const INACTIVITY_START_TIME = 3000;
-    const CENTER_PULL_STRENGTH = 0.0000002;
-
-    const now = Date.now();
-    const centerX = viewportRef.current.width / 2;
-    const centerY = viewportRef.current.height / 2;
-    const nodesToRemove: string[] = [];
-    const offscreenMargin = 200;
-
-    const connectedNodeIds = new Set<string>();
-    activeConnections.current.forEach(conn => {
-      if (now - conn.lastActive < connectionLifetime) {
-        connectedNodeIds.add(conn.sourceId);
-        connectedNodeIds.add(conn.targetId);
-      }
-    });
-
-      // --- Pinned Node Positioning ---
-      const renderedNodes = Array.from(activeNodes.current.values());
-      const pinnedNodes = renderedNodes.filter(node => isPined(node.id));
-      const sortedPinnedNodes = pinnedNodes.sort((a, b) => a.id.localeCompare(b.id));
-      
-      const NODES_PER_COLUMN = 18;
-      const COLUMN_SPACING = 200;
-      const NODE_SPACING_Y = 50;
-
-      sortedPinnedNodes.forEach((node, index) => {
-        const column = Math.floor(index / NODES_PER_COLUMN);
-        const rowIndex = index % NODES_PER_COLUMN;
-        
-        const x = viewportRef.current.width - 100 - (column * COLUMN_SPACING);
-        const y = 100 + (rowIndex * NODE_SPACING_Y);
-
-        pinnedNodePositions.current.set(node.id, { x, y });
-      });
-
-
-      // Apply forces
-      activeNodes.current.forEach(node => {
-        if (isPined(node.id)) {
-          const pos = pinnedNodePositions.current.get(node.id);
-          if (pos) {
-            node.x = pos.x;
-            node.y = pos.y;
-            node.vx = 0;
-            node.vy = 0;
-          }
-          return; // Skip other physics for pinned nodes
-        }
-
-      const timeSinceActive = now - node.lastActive;
-
-      if (timeSinceActive > INACTIVE_REMOVAL_SECONDS * 1000) {
-        nodesToRemove.push(node.id);
-        return;
-      }
-
-      const isOffscreen =
-        node.x < -offscreenMargin ||
-        node.x > viewportRef.current.width + offscreenMargin ||
-        node.y < -offscreenMargin ||
-        node.y > viewportRef.current.height + offscreenMargin;
-
-      if (isOffscreen) {
-        nodesToRemove.push(node.id);
-        return;
-      }
-
-      // Always apply drift unless the node is connected
-      if (!connectedNodeIds.has(node.id)) {
-        const driftForce = driftAwayStrength * 0.000001;
-        const dx = node.x - centerX;
-        const dy = node.y - centerY;
-        node.vx += dx * driftForce * deltaTime;
-        node.vy += dy * driftForce * deltaTime;
-      }
-      
-      // Handle fading for inactive nodes
-      if (timeSinceActive > INACTIVITY_START_TIME) {
-        const fadeDuration = (INACTIVE_REMOVAL_SECONDS * 1000) - INACTIVITY_START_TIME;
-        const fadeProgress = (timeSinceActive - INACTIVITY_START_TIME) / fadeDuration;
-        node.alpha = 1 - Math.min(1, fadeProgress);
-      } else {
-        node.alpha = 1; // Instantly restore alpha if it becomes active again
-      }
-    });
-
-    // Collision detection and resolution
-    const nodes = Array.from(activeNodes.current.values());
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const nodeA = nodes[i];
-        const nodeB = nodes[j];
-        const dx = nodeB.x - nodeA.x;
-        const dy = nodeB.y - nodeA.y;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-        const minDistance = nodeA.radius + nodeB.radius + nodeSpacing;
-
-        if (distance < minDistance) {
-          const overlap = minDistance - distance;
-          const ax = dx / distance;
-          const ay = dy / distance;
-
-          const repulsionForce = collisionRepulsion * REPULSION_SCALING;
-          nodeA.vx -= ax * overlap * repulsionForce;
-          nodeA.vy -= ay * overlap * repulsionForce;
-          nodeB.vx += ax * overlap * repulsionForce;
-          nodeB.vy += ay * overlap * repulsionForce;
-        }
-      }
-    }
-
-    activeConnections.current.forEach(conn => {
-      // Expired connections should not apply physics
-      if (now - conn.lastActive > connectionLifetime) {
-        return;
-      }
-      const source = activeNodes.current.get(conn.sourceId);
-      const target = activeNodes.current.get(conn.targetId);
-
-      if (source && target) {
-        const isSourcePinned = isPined(source.id);
-        const isTargetPinned = isPined(target.id);
-        const PULL_IN_SPEED = 0.1; // Aggressive pull-in
-        const ORBIT_DISTANCE = 30; // 30px orbit
-
-        if (isSourcePinned && !isTargetPinned) {
-          const dx = target.x - source.x;
-          const dy = target.y - source.y;
-          const distance = Math.sqrt(dx * dx + dy * dy);
-          if (distance > ORBIT_DISTANCE) {
-            const targetX = source.x + (dx / distance) * ORBIT_DISTANCE;
-            const targetY = source.y + (dy / distance) * ORBIT_DISTANCE;
-            target.x = lerp(target.x, targetX, PULL_IN_SPEED);
-            target.y = lerp(target.y, targetY, PULL_IN_SPEED);
-          }
-        } else if (!isSourcePinned && isTargetPinned) {
-          const dx = source.x - target.x;
-          const dy = source.y - target.y;
-          const distance = Math.sqrt(dx * dx + dy * dy);
-          if (distance > ORBIT_DISTANCE) {
-            const targetX = target.x + (dx / distance) * ORBIT_DISTANCE;
-            const targetY = target.y + (dy / distance) * ORBIT_DISTANCE;
-            source.x = lerp(source.x, targetX, PULL_IN_SPEED);
-            source.y = lerp(source.y, targetY, PULL_IN_SPEED);
-          }
-        } else {
-          const dx = target.x - source.x;
-          const dy = target.y - source.y;
-          const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-          const restLength = 40; // The desired distance between connected nodes
-
-          const displacement = distance - restLength;
-          const pullForce = connectionPullStrength * PULL_SCALING;
-          
-          // Apply a spring-like force (F = -kx)
-          const forceMagnitude = displacement * pullForce * 0.1; // Using a smaller multiplier for stability
-          
-          const fx = (dx / distance) * forceMagnitude;
-          const fy = (dy / distance) * forceMagnitude;
-
-          source.vx += fx * deltaTime;
-          source.vy += fy * deltaTime;
-          target.vx -= fx * deltaTime;
-          target.vy -= fy * deltaTime;
-        }
-
-        // 2. Center pull for connected nodes
-        const source_dx_center = centerX - source.x;
-        const source_dy_center = centerY - source.y;
-        source.vx += source_dx_center * CENTER_PULL_STRENGTH * deltaTime;
-        source.vy += source_dy_center * CENTER_PULL_STRENGTH * deltaTime;
-
-        const target_dx_center = centerX - target.x;
-        const target_dy_center = centerY - target.y;
-        target.vx += target_dx_center * CENTER_PULL_STRENGTH * deltaTime;
-        target.vy += target_dy_center * CENTER_PULL_STRENGTH * deltaTime;
-
-        // When a connection is active, stop drifting and reset velocity
-        if (source.isDriftingAway) {
-          source.isDriftingAway = false;
-          source.vx = 0;
-          source.vy = 0;
-        }
-        if (target.isDriftingAway) {
-          target.isDriftingAway = false;
-          target.vx = 0;
-          target.vy = 0;
-        }
-      }
-    });
-
-    // Handle removal after physics calculations
-    if (nodesToRemove.length > 0) {
-      const removeFunc = useNetworkStore.getState().removeNode;
-      nodesToRemove.forEach(id => removeFunc(id));
-    }
-
-    // Update positions
-    activeNodes.current.forEach(node => {
-      node.vx *= damping;
-      node.vy *= damping;
-
-      node.x += node.vx * deltaTime;
-      node.y += node.vy * deltaTime;
-    });
-
-  }, [width, height, nodeSpacing, connectionPullStrength, collisionRepulsion, damping, driftAwayStrength]);
-
-  // High-performance render loop
-  const render = useCallback((currentTime: number) => {
-    const deltaTime = Math.max(16, currentTime - lastFrameTime.current); // Clamp to avoid huge jumps
-    lastFrameTime.current = currentTime;
-
-    // Update physics simulation
-    updatePhysics(deltaTime);
-
-    const canvas = canvasRef.current
-    if (!canvas || !width || !height) return;
-
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-    
-    // Log dimensions every 2 seconds to avoid spamming the console
-    if (currentTime - lastLogTime.current > 2000) {
-      logger.log(`[Debug] Canvas dimensions received by renderer: width=${width} height=${height}`);
-      lastLogTime.current = currentTime;
-    }
-
-    // Calculate FPS
-    frameCount.current++
-    if (currentTime - lastFrameTime.current >= 1000) {
-      fpsRef.current = frameCount.current
-      frameCount.current = 0
-      lastFrameTime.current = currentTime
-    }
-
-    // Clear canvas using logical dimensions, as context is already scaled by DPR
-    ctx.fillStyle = 'black'
-    ctx.fillRect(0, 0, width, height)
-    
-    // DEBUG: Draw a border to check canvas boundaries
-    ctx.strokeStyle = 'red';
-    ctx.lineWidth = 1; // 1 logical pixel will be scaled by DPR
-    ctx.strokeRect(0, 0, width, height);
-
-
-    const vp = viewportRef.current
-
-    // Save context and apply viewport transform
-    ctx.save()
-    ctx.translate(-vp.x * vp.zoom, -vp.y * vp.zoom)
-    ctx.scale(vp.zoom, vp.zoom)
-
-    // Render connections first (behind nodes) with protocol-based styling
-    activeConnections.current.forEach(conn => {
-      const source = activeNodes.current.get(conn.sourceId);
-      const target = activeNodes.current.get(conn.targetId);
-
-      if (!source || !target) return;
-
-      // Protocol-based colors and styles using stored protocol
-      let strokeColor = `rgba(0, 255, 255, ${conn.alpha})` // Default cyan
-      let lineWidth = 1
-      
-      if (conn.protocol) {
-        const protocol = conn.protocol.toLowerCase();
-        // Debug log to see what protocols we're getting
-        if (verboseLogging && Math.random() < 0.01) { // Log 1% of connections to avoid spam
-          logger.log(`🎨 Connection protocol: ${protocol} for ${conn.sourceId} -> ${conn.targetId}`);
-        }
-        
-        switch (protocol) {
-          case 'tcp':
-            strokeColor = `rgba(0, 255, 0, ${conn.alpha})`; // Bright green for TCP
-            lineWidth = 3; // Thicker line
-            break;
-          case 'udp':
-            strokeColor = `rgba(255, 0, 255, ${conn.alpha})`; // Bright magenta for UDP
-            lineWidth = 2; // Medium line
-            break;
-          case 'icmp':
-            strokeColor = `rgba(255, 255, 0, ${conn.alpha})`; // Bright yellow for ICMP
-            lineWidth = 2; // Medium line
-            break;
-          case 'http':
-          case 'https':
-            strokeColor = `rgba(255, 165, 0, ${conn.alpha})`; // Orange for HTTP/HTTPS
-            lineWidth = 2;
-            break;
-          default:
-            strokeColor = `rgba(0, 255, 255, ${conn.alpha})`; // Cyan for others
-            lineWidth = 1;
-            // Log unknown protocols
-            if (verboseLogging && Math.random() < 0.05) {
-              logger.log(`🔍 Unknown protocol: ${protocol}`);
-            }
-        }
-      } else {
-        // Debug: no protocol found
-        if (verboseLogging && Math.random() < 0.01) {
-          logger.log(`⚠️ No protocol found for connection ${conn.sourceId} -> ${conn.targetId}`);
-        }
-      }
-      
-      // Make very active connections more prominent regardless of protocol
-      if (conn.alpha > 0.8) {
-        lineWidth += 1;
-      }
-      
-      ctx.strokeStyle = strokeColor
-      ctx.lineWidth = lineWidth
-      ctx.beginPath()
-      ctx.moveTo(source.x, source.y)
-      ctx.lineTo(target.x, target.y)
-      ctx.stroke()
-      
-      // Add arrow indicator for direction and port/protocol info (if zoom is high enough)
-      if (vp.zoom > 0.8) {
-        const dx = target.x - source.x
-        const dy = target.y - source.y
-        const len = Math.sqrt(dx * dx + dy * dy)
-        
-        if (len > 20) {
-          // Calculate midpoint for text
-          const midX = source.x + dx * 0.5
-          const midY = source.y + dy * 0.5
-          
-          // --- Draw Port and Protocol Text ---
-          const protocolText = (conn.protocol?.toUpperCase() || '???');
-          const portText = conn.dstPort > 0 ? `:${conn.dstPort}` : '';
-          const fullText = `${protocolText}${portText}`;
-          
-          ctx.font = `${Math.max(9, 11 * vp.zoom)}px monospace`;
-          const textWidth = ctx.measureText(fullText).width;
-
-          // Rotate context to draw text along the line
-          ctx.save();
-          ctx.translate(midX, midY);
-          ctx.rotate(Math.atan2(dy, dx));
-          
-          // Add background for readability
-          ctx.fillStyle = `rgba(0, 0, 0, 0.7)`;
-          ctx.fillRect(-textWidth / 2 - 2, -6, textWidth + 4, 12);
-
-          // Draw the text
-          ctx.fillStyle = `rgba(0, 255, 255, ${conn.alpha})`; // Bright blue for port number
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(fullText, 0, 0);
-          
-          ctx.restore();
-        }
-      }
-    })
-
-    // Determine which nodes have active connections to render them on top
-    const now = currentTime
-    const nodesWithActiveConnections = new Set<string>()
-    activeConnections.current.forEach(conn => {
-      // An active connection is one that is still visible
-      if (now - conn.lastActive < connectionLifetime) {
-        nodesWithActiveConnections.add(conn.sourceId)
-        nodesWithActiveConnections.add(conn.targetId)
-      }
-    })
-
-    // Get nodes and sort them so active ones are drawn last (on top)
-    const nodesToRender = Array.from(activeNodes.current.values())
-    nodesToRender.sort((a, b) => {
-      const aHasActiveConnection = nodesWithActiveConnections.has(a.id)
-      const bHasActiveConnection = nodesWithActiveConnections.has(b.id)
-
-      if (aHasActiveConnection && !bHasActiveConnection) return 1
-      if (!aHasActiveConnection && bHasActiveConnection) return -1
-      
-      // If both have similar connection status, sort by recent activity
-      return a.lastActive - b.lastActive
-    })
-
-    // Render nodes with enhanced IP address display
-    nodesToRender.forEach(node => {
-      // Use the enhanced node color system
-      const protocolRgb = hexToRgb(node.color)
-      const highlightRgb = hexToRgb(node.highlightColor)
-      
-      const [pr, pg, pb] = protocolRgb ? [protocolRgb.r, protocolRgb.g, protocolRgb.b] : [204, 204, 204] // fallback to gray
-      const [hr, hg, hb] = highlightRgb ? [highlightRgb.r, highlightRgb.g, highlightRgb.b] : [0, 255, 65] // fallback to green
-
-      // Draw main node circle with protocol color
-      ctx.fillStyle = `rgba(${pr}, ${pg}, ${pb}, ${node.alpha})`
-      ctx.beginPath()
-      ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2)
-      ctx.fill()
-
-      if (isPined(node.id)) {
-        ctx.strokeStyle = '#FFFF00'; // Yellow highlight for pinned nodes
-        ctx.lineWidth = 3;
-        ctx.stroke();
-
-        // Draw pin emoji in the center
-        ctx.font = `${node.radius * 1.5}px sans-serif`;
+      // Port/protocol label. Show ALL of them when zoomed in; at the overview,
+      // show only interesting edges (high fan-out degree, or touching a pinned
+      // node) up to a budget, so scans reveal their target ports without having
+      // to zoom all the way in. dstPort is the store's latest, so a connection
+      // that switches ports relabels automatically.
+      const interestingEdge = degree >= 6 || src.pinned || tgt.pinned;
+      const showPort = (edge.dstPort ?? 0) > 0 && (
+        vp.zoom > 1.5 ||
+        (interestingEdge && vp.zoom >= FIT_ZOOM * 0.9 && portLabels < 70)
+      );
+      if (showPort) {
+        const label   = `${edge.protocol?.toUpperCase() ?? ''}:${edge.dstPort}`;
+        const fontSize = 11 / vp.zoom;                 // constant screen px
+        const mx = (src.x + tgt.x) / 2;
+        const my = (src.y + tgt.y) / 2;
+        ctx.font = `${fontSize}px monospace`;
         ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('📌', node.x, node.y);
-      }
-      
-      // Add border for better visibility
-      ctx.strokeStyle = `rgba(${pr}, ${pg}, ${pb}, ${node.alpha})`
-      ctx.lineWidth = 1
-      ctx.stroke()
-      
-      // Add glow effect for active nodes (larger radius = more active)
-      if (node.radius > 7) {
-        ctx.fillStyle = `rgba(${hr}, ${hg}, ${hb}, ${node.alpha * 0.3})`
-        ctx.beginPath()
-        ctx.arc(node.x, node.y, node.radius * 1.5, 0, Math.PI * 2)
-        ctx.fill()
-      }
-      
-      // Draw IP address label for nodes (if zoom is high enough)
-      if (vp.zoom > 0.75 && node.id.includes('.')) {
-        ctx.fillStyle = `rgba(${hr}, ${hg}, ${hb}, ${node.alpha * 0.9})`
-        ctx.font = `${Math.max(8, 10 * vp.zoom)}px monospace`
-        ctx.textAlign = 'center'
-        
-        // Position text below the node
-        const textY = node.y + node.radius + 15
-        
-        // For IP addresses, show short form if zoom is low
-        let displayText = node.id
-        if (vp.zoom < 1) {
-          // Show only last two octets when zoomed out
-          const parts = node.id.split('.')
-          if (parts.length === 4) {
-            displayText = `...${parts[2]}.${parts[3]}`
+        // Overview labels cull overlaps so the watch zone stays legible.
+        if (vp.zoom <= 1.5) {
+          const tw = ctx.measureText(label).width;
+          const box = { x1: mx - tw / 2, y1: my - fontSize, x2: mx + tw / 2, y2: my + fontSize };
+          const clash = portLabelBoxes.some(b => box.x1 < b.x2 && box.x2 > b.x1 && box.y1 < b.y2 && box.y2 > b.y1);
+          if (!clash) {
+            portLabelBoxes.push(box);
+            ctx.fillStyle = edgeColor(edge.protocol, Math.min(1, edge.alpha + 0.4), theme);
+            ctx.fillText(label, mx, my);
+            portLabels++;
           }
+        } else {
+          ctx.fillStyle = edgeColor(edge.protocol, edge.alpha, theme);
+          ctx.fillText(label, mx, my);
         }
-        
-        // Draw text with background for better readability
-        const textWidth = ctx.measureText(displayText).width
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)'
-        ctx.fillRect(node.x - textWidth/2 - 2, textY - 10, textWidth + 4, 12)
-        
-        ctx.fillStyle = `rgba(${hr}, ${hg}, ${hb}, ${node.alpha})`
-        ctx.fillText(displayText, node.x, textY)
       }
-    })
-    
-    ctx.textAlign = 'left' // Reset text alignment
+    });
 
-    ctx.restore()
+    // ── Draw nodes ──────────────────────────────────────────────────────────
+    // Labels are readable even at the zoomed-out fit level: font is sized in
+    // constant SCREEN pixels (world font = screenPx / zoom), and overlapping
+    // labels are always culled so overview stays clean — only the labels that
+    // fit without colliding get drawn, more appearing as you zoom in.
+    const labelZoomThreshold = FIT_ZOOM * 0.85; // visible at the default fit zoom
+    const labelScreenPx = nodes.size > 500 ? 9 : 11;
+    const labelBoxes: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
+    nodes.forEach(node => {
+      if (node.alpha <= 0) return;
 
-    // No data message
-    if (activeNodes.current.size === 0) {
-      ctx.fillStyle = '#888'
-      ctx.font = '16px monospace'
-      ctx.textAlign = 'center'
-      ctx.fillText(
-        'Waiting for network activity...', 
-        vp.width / 2, 
-        vp.height / 2
-      )
-      ctx.textAlign = 'left'
-    }
+      const hr = parseInt(node.highlightColor.slice(1, 3), 16);
+      const hg = parseInt(node.highlightColor.slice(3, 5), 16);
+      const hb = parseInt(node.highlightColor.slice(5, 7), 16);
+      // Pinned nodes always render as fully-present (and labelled) so the dock
+      // stays legible even when a pin goes momentarily quiet.
+      const isConnected = connectedIds.has(node.id) || node.pinned;
+      const visualAlpha = isConnected ? node.alpha : node.alpha * 0.35;
 
-    // Only continue animation if there are nodes to render or user is interacting
-    if (activeNodes.current.size > 0) {
-      animationRef.current = requestAnimationFrame(render)
-    } else {
-      // No nodes - render once more to show "waiting" message and stop
-      setTimeout(() => {
-        if (canvasRef.current) { // Check if component is still mounted
-        animationRef.current = requestAnimationFrame(render)
-        }
-      }, 1000) // Render every second when no data
-    }
-  }, [updatePhysics, connectionLifetime, width, height])
+      // Node fill: per-subnet hue from the active theme, brighter when talking.
+      // This is what makes subnet blobs read as coherent color groups.
+      const bodyColor = subnetNodeColor(node.clusterKey, isConnected ? 1 : 0.35, theme);
 
-  // Mouse interaction for panning and zooming
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-
-    let isDragging = false
-    let lastMouseX = 0
-    let lastMouseY = 0
-
-    const handleMouseDown = (e: MouseEvent) => {
-      isDragging = true
-      lastMouseX = e.clientX
-      lastMouseY = e.clientY
-      canvas.style.cursor = 'grabbing'
-    }
-
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!isDragging) return
-
-      const deltaX = (e.clientX - lastMouseX) / viewportRef.current.zoom
-      const deltaY = (e.clientY - lastMouseY) / viewportRef.current.zoom
-
-      viewportRef.current.x -= deltaX
-      viewportRef.current.y -= deltaY
-
-      lastMouseX = e.clientX
-      lastMouseY = e.clientY
-    }
-
-    const handleMouseUp = () => {
-      isDragging = false
-      canvas.style.cursor = 'grab'
-    }
-
-    const handleWheel = (e: WheelEvent) => {
-      e.preventDefault()
-      const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1
-      const newZoom = Math.max(0.1, Math.min(5, viewportRef.current.zoom * zoomFactor))
-      
-      // Zoom towards mouse position
-      const rect = canvas.getBoundingClientRect()
-      const mouseX = e.clientX - rect.left
-      const mouseY = e.clientY - rect.top
-      
-      const worldX = (mouseX / viewportRef.current.zoom) + viewportRef.current.x
-      const worldY = (mouseY / viewportRef.current.zoom) + viewportRef.current.y
-      
-      viewportRef.current.zoom = newZoom
-      viewportRef.current.x = worldX - (mouseX / newZoom)
-      viewportRef.current.y = worldY - (mouseY / newZoom)
-    }
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'r' || e.key === 'R') {
-        // Reset view to show full network
-        viewportRef.current.x = -400
-        viewportRef.current.y = -200
-        viewportRef.current.zoom = 0.3
-        logger.log('🔄 View reset to show full network')
+      // Glow ring for active nodes
+      if (node.radius > 7 && isConnected) {
+        ctx.fillStyle = `rgba(${hr},${hg},${hb},${visualAlpha * 0.3})`;
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, node.radius * 1.5, 0, Math.PI * 2);
+        ctx.fill();
       }
+
+      // Node body
+      ctx.globalAlpha = visualAlpha;
+      ctx.fillStyle   = bodyColor;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, isConnected ? node.radius : node.radius * 0.7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // Label connected nodes (the active conversations). Font is constant on
+      // screen regardless of zoom; overlapping labels are always dropped, so
+      // the overview shows a clean sparse set and detail fills in on zoom-in.
+      // Cap labels per frame: canvas fillText/measureText is costly, and at
+      // wide spacing few labels overlap (so many would draw). Bound it.
+      if (labelBoxes.length < 140 && isConnected && node.id.includes('.') && vp.zoom >= labelZoomThreshold) {
+        const fontSize = labelScreenPx / vp.zoom; // constant screen px
+        ctx.font      = `${fontSize}px monospace`;
+        ctx.textAlign = 'center';
+        const pad = 3 / vp.zoom;
+        const textY = node.y + node.radius + fontSize + pad;
+        const tw    = ctx.measureText(node.id).width;
+        const labelBox = {
+          x1: node.x - tw / 2 - pad,
+          y1: textY - fontSize - pad,
+          x2: node.x + tw / 2 + pad,
+          y2: textY + pad,
+        };
+        const overlapsLabel = labelBoxes.some(box =>
+          labelBox.x1 < box.x2 &&
+          labelBox.x2 > box.x1 &&
+          labelBox.y1 < box.y2 &&
+          labelBox.y2 > box.y1
+        );
+        if (overlapsLabel) return; // always cull overlaps → clean at every zoom
+        labelBoxes.push(labelBox);
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(labelBox.x1, labelBox.y1, tw + pad * 2, fontSize + pad * 2);
+        ctx.fillStyle = `rgba(${hr},${hg},${hb},${node.alpha})`;
+        ctx.fillText(node.id, node.x, textY);
+      }
+    });
+
+    ctx.textAlign = 'left';
+    ctx.restore();
+
+    // No-data overlay
+    if (nodes.size === 0) {
+      ctx.fillStyle = '#444';
+      ctx.font      = '16px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Waiting for network activity...', vp.width / 2, vp.height / 2);
+      ctx.textAlign = 'left';
     }
 
-    canvas.addEventListener('mousedown', handleMouseDown)
-    canvas.addEventListener('mousemove', handleMouseMove)
-    canvas.addEventListener('mouseup', handleMouseUp)
-    canvas.addEventListener('mouseleave', handleMouseUp)
-    canvas.addEventListener('wheel', handleWheel)
-    document.addEventListener('keydown', handleKeyDown)
-    canvas.style.cursor = 'grab'
-    
-    // Make canvas focusable for keyboard events
-    canvas.tabIndex = 0
-    canvas.focus()
-
-    return () => {
-      canvas.removeEventListener('mousedown', handleMouseDown)
-      canvas.removeEventListener('mousemove', handleMouseMove)
-      canvas.removeEventListener('mouseup', handleMouseUp)
-      canvas.removeEventListener('mouseleave', handleMouseUp)
-      canvas.removeEventListener('wheel', handleWheel)
-      document.removeEventListener('keydown', handleKeyDown)
-    }
-  }, [])
-
-  // Update render objects periodically - less aggressive updates
-  useEffect(() => {
-    updateRenderObjects()
-    
-    // Only update every 2 seconds instead of 1 second for better performance
-    const interval = setInterval(updateRenderObjects, 2000)
-    return () => clearInterval(interval)
-  }, [updateRenderObjects])
+    animationRef.current = requestAnimationFrame(render);
+  }, [tick, layoutNodes, layoutEdges]);
 
   // Start/stop render loop
   useEffect(() => {
-    if (canvasRef.current) {
-      animationRef.current = requestAnimationFrame(render)
-    }
+    if (canvasRef.current) animationRef.current = requestAnimationFrame(render);
+    return () => { if (animationRef.current) cancelAnimationFrame(animationRef.current); };
+  }, [render]);
+
+  // ── Pan / zoom / keyboard ───────────────────────────────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let dragging = false, lastX = 0, lastY = 0;
+
+    const onDown  = (e: MouseEvent) => { dragging = true; lastX = e.clientX; lastY = e.clientY; canvas.style.cursor = 'grabbing'; };
+    const onMove  = (e: MouseEvent) => {
+      if (!dragging) return;
+      viewportRef.current.x -= (e.clientX - lastX) / viewportRef.current.zoom;
+      viewportRef.current.y -= (e.clientY - lastY) / viewportRef.current.zoom;
+      lastX = e.clientX; lastY = e.clientY;
+    };
+    const onUp    = () => { dragging = false; canvas.style.cursor = 'grab'; };
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const newZoom = Math.max(0.1, Math.min(5, viewportRef.current.zoom * (e.deltaY > 0 ? 0.9 : 1.1)));
+      const rect    = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      const wx = mx / viewportRef.current.zoom + viewportRef.current.x;
+      const wy = my / viewportRef.current.zoom + viewportRef.current.y;
+      viewportRef.current.zoom = newZoom;
+      viewportRef.current.x    = wx - mx / newZoom;
+      viewportRef.current.y    = wy - my / newZoom;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'r' || e.key === 'R') { viewportRef.current.x = 0; viewportRef.current.y = 0; viewportRef.current.zoom = FIT_ZOOM; }
+    };
+
+    canvas.addEventListener('mousedown',  onDown);
+    canvas.addEventListener('mousemove',  onMove);
+    canvas.addEventListener('mouseup',    onUp);
+    canvas.addEventListener('mouseleave', onUp);
+    canvas.addEventListener('wheel',      onWheel, { passive: false });
+    document.addEventListener('keydown',  onKey);
+    canvas.style.cursor = 'grab';
+    canvas.tabIndex = 0;
 
     return () => {
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current)
-      }
-    }
-  }, [render])
+      canvas.removeEventListener('mousedown',  onDown);
+      canvas.removeEventListener('mousemove',  onMove);
+      canvas.removeEventListener('mouseup',    onUp);
+      canvas.removeEventListener('mouseleave', onUp);
+      canvas.removeEventListener('wheel',      onWheel);
+      document.removeEventListener('keydown',  onKey);
+    };
+  }, []);
 
   return (
     <canvas
       ref={canvasRef}
-      style={{
-        width: '100%',
-        height: '100%',
-        display: 'block',
-        background: 'black'
-      }}
+      style={{ width: '100%', height: '100%', display: 'block', background: 'black' }}
     />
-  )
-})
+  );
+});
 
-CanvasNetworkRenderer.displayName = 'CanvasNetworkRenderer'
+CanvasNetworkRenderer.displayName = 'CanvasNetworkRenderer';

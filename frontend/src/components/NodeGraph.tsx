@@ -64,10 +64,7 @@ export const NodeGraph = () => {
     const container = new Container()
     const circle = new Graphics()
     
-    // Random position if not specified
-    const position = node.x !== undefined && node.y !== undefined 
-      ? { x: node.x, y: node.y }
-      : generateRandomPosition()
+    const position = generateRandomPosition()
     
     // Draw circle
     circle.clear()
