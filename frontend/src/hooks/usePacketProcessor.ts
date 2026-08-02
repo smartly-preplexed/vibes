@@ -3,6 +3,18 @@ import { usePacketStore } from '../stores/packetStore';
 import { useNetworkStore, Node } from '../stores/networkStore';
 import { logger } from '../utils/logger';
 
+// A real dotted-quad IPv4 address (each octet 0-255). Rejects "<nil>", "",
+// IPv6, and any Layer-2 / malformed identifier so no blank nodes are created.
+const isIPv4 = (s: string | undefined): boolean => {
+  if (!s) return false;
+  const p = s.split('.');
+  return p.length === 4 && p.every(o => {
+    if (!/^\d{1,3}$/.test(o)) return false;
+    const n = Number(o);
+    return n >= 0 && n <= 255;
+  });
+};
+
 // Generate a stable spawn position from an IP address.
 // Uses IP structure to cluster addresses by subnet — 192.168.x in one region,
 // 10.x in another, etc. Physics will refine positions after spawn.
@@ -117,7 +129,9 @@ export const usePacketProcessor = () => {
     newPackets.forEach(packet => {
       const seq = packet.seq ?? 0;
       if (seq > maxSeq) maxSeq = seq;
-      if (!packet.src || !packet.dst) return;
+      // Defensive: drop anything without a real IPv4 src+dst (Layer-2 / malformed
+      // frames that slipped through as "<nil>" or blank never become nodes).
+      if (!isIPv4(packet.src) || !isIPv4(packet.dst)) return;
 
       const key = getConversationKey(packet.src, packet.dst);
       const existing = flowBuffer.current.get(key);

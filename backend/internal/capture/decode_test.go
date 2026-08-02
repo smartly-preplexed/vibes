@@ -56,3 +56,38 @@ func TestDecodeCapturedPacketNonIPReturnsNil(t *testing.T) {
 		t.Fatalf("expected nil for garbage frame, got %+v", p)
 	}
 }
+
+// A Layer-2 frame (ARP here) must never become a node — no IPs to plot.
+func TestDecodeCapturedPacketARPReturnsNil(t *testing.T) {
+	eth := &layers.Ethernet{
+		SrcMAC:       net.HardwareAddr{0, 1, 2, 3, 4, 5},
+		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		EthernetType: layers.EthernetTypeARP,
+	}
+	arp := &layers.ARP{
+		AddrType: layers.LinkTypeEthernet, Protocol: layers.EthernetTypeIPv4,
+		HwAddressSize: 6, ProtAddressSize: 4, Operation: 1,
+		SourceHwAddress: []byte{0, 1, 2, 3, 4, 5}, SourceProtAddress: []byte{192, 168, 1, 2},
+		DstHwAddress: []byte{0, 0, 0, 0, 0, 0}, DstProtAddress: []byte{192, 168, 1, 1},
+	}
+	buf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{FixLengths: true}, eth, arp); err != nil {
+		t.Fatal(err)
+	}
+	if p := decodeCapturedPacket(buf.Bytes(), layers.LinkTypeEthernet, "dumpcap"); p != nil {
+		t.Fatalf("expected nil for ARP (Layer-2) frame, got %+v", p)
+	}
+}
+
+func TestValidIPv4(t *testing.T) {
+	for _, s := range []string{"192.168.1.1", "10.0.0.5", "8.8.8.8", "0.0.0.0"} {
+		if !validIPv4(s) {
+			t.Errorf("expected %q valid", s)
+		}
+	}
+	for _, s := range []string{"", "<nil>", "fe80::1", "not.an.ip.x", "256.1.1.1", "1.2.3"} {
+		if validIPv4(s) {
+			t.Errorf("expected %q invalid", s)
+		}
+	}
+}
