@@ -156,34 +156,43 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
     const labelZoomThreshold = FIT_ZOOM * 0.85; // visible at the default fit zoom
     const labelScreenPx = nodes.size > 500 ? 9 : 11;
     const labelBoxes: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
+    // When a focus burst exists, dim the bulk so the central scan/fan-out star
+    // stands out as the thing to watch.
+    let anyFocus = false;
+    nodes.forEach(n => { if (n.focus) anyFocus = true; });
     nodes.forEach(node => {
       if (node.alpha <= 0) return;
 
       const hr = parseInt(node.highlightColor.slice(1, 3), 16);
       const hg = parseInt(node.highlightColor.slice(3, 5), 16);
       const hb = parseInt(node.highlightColor.slice(5, 7), 16);
-      // Pinned nodes always render as fully-present (and labelled) so the dock
-      // stays legible even when a pin goes momentarily quiet.
-      const isConnected = connectedIds.has(node.id) || node.pinned;
-      const visualAlpha = isConnected ? node.alpha : node.alpha * 0.35;
+      // Pinned + focus nodes always render fully-present (and labelled); bulk is
+      // dimmed while a focus burst is active so the middle is the watch zone.
+      const isFocus = node.focus;
+      const isConnected = connectedIds.has(node.id) || node.pinned || isFocus;
+      const dimBulk = anyFocus && !isFocus && !node.pinned;
+      const visualAlpha = isFocus ? 1
+        : isConnected ? node.alpha * (dimBulk ? 0.34 : 1)
+        : node.alpha * (anyFocus ? 0.1 : 0.35);
 
       // Node fill: per-subnet hue from the active theme, brighter when talking.
       // This is what makes subnet blobs read as coherent color groups.
       const bodyColor = subnetNodeColor(node.clusterKey, isConnected ? 1 : 0.35, theme);
 
-      // Glow ring for active nodes
-      if (node.radius > 7 && isConnected) {
-        ctx.fillStyle = `rgba(${hr},${hg},${hb},${visualAlpha * 0.3})`;
+      // Glow ring — always for focus nodes (stronger), plus active nodes.
+      if (isFocus || (node.radius > 7 && isConnected && !dimBulk)) {
+        ctx.fillStyle = `rgba(${hr},${hg},${hb},${(isFocus ? 0.45 : visualAlpha * 0.3)})`;
         ctx.beginPath();
-        ctx.arc(node.x, node.y, node.radius * 1.5, 0, Math.PI * 2);
+        ctx.arc(node.x, node.y, node.radius * (isFocus ? 2.2 : 1.5), 0, Math.PI * 2);
         ctx.fill();
       }
 
-      // Node body
+      // Node body (focus nodes drawn larger so the star pops)
+      const bodyR = isFocus ? node.radius * 1.5 : isConnected ? node.radius : node.radius * 0.7;
       ctx.globalAlpha = visualAlpha;
       ctx.fillStyle   = bodyColor;
       ctx.beginPath();
-      ctx.arc(node.x, node.y, isConnected ? node.radius : node.radius * 0.7, 0, Math.PI * 2);
+      ctx.arc(node.x, node.y, bodyR, 0, Math.PI * 2);
       ctx.fill();
       ctx.globalAlpha = 1;
 
@@ -192,7 +201,7 @@ export const CanvasNetworkRenderer: React.FC = React.memo(() => {
       // the overview shows a clean sparse set and detail fills in on zoom-in.
       // Cap labels per frame: canvas fillText/measureText is costly, and at
       // wide spacing few labels overlap (so many would draw). Bound it.
-      if (labelBoxes.length < 140 && isConnected && node.id.includes('.') && vp.zoom >= labelZoomThreshold) {
+      if ((isFocus || labelBoxes.length < 140) && isConnected && node.id.includes('.') && vp.zoom >= labelZoomThreshold) {
         const fontSize = labelScreenPx / vp.zoom; // constant screen px
         ctx.font      = `${fontSize}px monospace`;
         ctx.textAlign = 'center';

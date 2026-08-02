@@ -21,6 +21,7 @@ export interface LayoutNode {
   alpha: number;
   lastActive: number;
   pinned: boolean;
+  focus: boolean;   // part of a central "focus burst" (scan hub or its target)
 }
 
 export interface LayoutEdge {
@@ -338,6 +339,7 @@ export function useGraphLayout(): GraphLayoutResult {
           alpha: 1,
           lastActive: sn.lastActive,
           pinned: false,
+          focus: false,
         };
         layoutNodes.current.set(id, newNode);
         if (!clusterSeed.has(clusterKey)) clusterSeed.set(clusterKey, newNode);
@@ -465,6 +467,54 @@ export function useGraphLayout(): GraphLayoutResult {
       clusterHome.set(key, t);
     });
 
+    // ── Focus bursts: surface scan / fan-out hubs to the centre ──────────────
+    // Interest = distinct live peers (fan-out breadth) + distinct dst ports
+    // (port-sweep breadth). The few highest-interest hosts (a scan is one host
+    // hitting many hosts across many ports) are pulled to the centre and their
+    // targets arranged in a radial burst around them — a readable nmap "star".
+    // Everything else is bulk context (dimmed by the renderer).
+    const fanOut = new Map<string, Set<string>>();
+    const scanPorts = new Map<string, Set<number>>();
+    const addTo = <T,>(m: Map<string, Set<T>>, k: string, v: T) => {
+      let s = m.get(k); if (!s) { s = new Set(); m.set(k, s); } s.add(v);
+    };
+    layoutEdges.current.forEach(edge => {
+      if (now - edge.lastActive > connectionLifetime) return;
+      addTo(fanOut, edge.sourceId, edge.targetId);
+      addTo(fanOut, edge.targetId, edge.sourceId);
+      if (edge.dstPort) addTo(scanPorts, edge.sourceId, edge.dstPort);
+    });
+    const interestOf = (id: string) => (fanOut.get(id)?.size ?? 0) + (scanPorts.get(id)?.size ?? 0) * 1.5;
+    const FOCUS_MAX = 4;
+    const FOCUS_THRESHOLD = 8;          // genuine fan-out, not 1:1 chatter
+    const hubs = Array.from(layoutNodes.current.keys())
+      .filter(id => !isPined(id) && interestOf(id) >= FOCUS_THRESHOLD)
+      .sort((a, b) => interestOf(b) - interestOf(a))
+      .slice(0, FOCUS_MAX);
+    const burstTarget = new Map<string, { x: number; y: number }>();
+    const focusSet = new Set<string>();
+    const minDim = Math.min(worldW, worldH);
+    hubs.forEach((hubId, hi) => {
+      focusSet.add(hubId);
+      // Spread multiple hubs on a tight ring around centre so the burst reads as
+      // one central cluster, not scattered off-centre.
+      const hubAng = hubs.length > 1 ? (hi / hubs.length) * Math.PI * 2 : 0;
+      const hubR = hubs.length > 1 ? minDim * 0.06 : 0;
+      const hx = centerX + Math.cos(hubAng) * hubR;
+      const hy = centerY + Math.sin(hubAng) * hubR;
+      burstTarget.set(hubId, { x: hx, y: hy });
+      const victims = Array.from(fanOut.get(hubId) ?? []);
+      const rBurst = Math.min(minDim * 0.26, Math.max(minPairDist * 2, minPairDist * Math.sqrt(victims.length) * 0.7));
+      victims.forEach(vid => {
+        if (isPined(vid) || focusSet.has(vid)) return;   // don't steal pins / other hubs' nodes
+        const nh = hashStr(vid);
+        const ang = (nh % 360) * Math.PI / 180;
+        const rr = rBurst * (0.55 + ((nh >> 9) % 100) / 100 * 0.45);
+        burstTarget.set(vid, { x: hx + Math.cos(ang) * rr, y: hy + Math.sin(ang) * rr });
+        focusSet.add(vid);
+      });
+    });
+
     // ── Pinned nodes dock in a fixed SCREEN-space frame ──────────────────────
     // Straight down the right edge (below the top-right debug panel), then
     // wrapping right→left across the bottom; overflow stacks upward so a full
@@ -529,6 +579,7 @@ export function useGraphLayout(): GraphLayoutResult {
     const territoryRadius = (key: string) =>
       Math.max(hexSize * 0.3, minPairDist * Math.sqrt(subnetPop.get(key) ?? 1) * 0.55);
     layoutNodes.current.forEach(node => {
+      node.focus = focusSet.has(node.id);
       const h = clusterHome.get(node.clusterKey);
       if (h) {
         const nh = hashStr(node.id);
@@ -547,6 +598,17 @@ export function useGraphLayout(): GraphLayoutResult {
         // travel all the way to the pin and cluster beside it.
         node.vx += (attractor.x - node.x) * 0.05 * dtNorm;
         node.vy += (attractor.y - node.y) * 0.05 * dtNorm;
+        return;
+      }
+
+      const burst = burstTarget.get(node.id);
+      if (burst) {
+        // Focus hub or one of its targets → pull hard into the central burst,
+        // overriding territory home so the whole scan pattern gathers in the
+        // middle as a readable star (springs on these edges are weak, so this
+        // pull sets the geometry).
+        node.vx += (burst.x - node.x) * 0.09 * dtNorm;
+        node.vy += (burst.y - node.y) * 0.09 * dtNorm;
         return;
       }
 
@@ -720,10 +782,13 @@ export function useGraphLayout(): GraphLayoutResult {
       // neighbour sits right beside the dock (the attractor already walks it
       // there; this keeps it snug instead of held off at a long rest length).
       const pinEdge = source.pinned || target.pinned;
+      // Focus (burst) edges: the burst target positions define the star, so keep
+      // the spring very weak — it draws the spoke without collapsing the geometry.
+      const focusEdge = (source.focus || target.focus) && !pinEdge;
       const restLength = pinEdge
         ? NODE_RADIUS * 2 + adaptiveSpacing * 0.5
         : sameCluster ? tightRest : tightRest + Math.min(320, hexSize * 0.6);
-      const clusterResponse = pinEdge ? 1.3 : sameCluster ? 1.05 : 0.4;
+      const clusterResponse = (pinEdge ? 1.3 : sameCluster ? 1.05 : 0.4) * (focusEdge ? 0.15 : 1);
       const displacement = Math.max(-400, Math.min(400, dist - restLength));
       const spring = connectionPullStrength * 0.007 * clusterResponse * weightResponse * degreeResponse * displacement * dtNorm;
       const nx = dx / dist;
