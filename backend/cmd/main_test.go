@@ -25,6 +25,8 @@ func TestIsIPPinned(t *testing.T) {
 		{"Full range - true crossover", []string{"192.168.1.250-192.168.2.10"}, "192.168.2.5", true},
 		{"Full range - boundary end", []string{"192.168.1.250-192.168.2.10"}, "192.168.2.10", true},
 		{"Full range - false", []string{"192.168.1.250-192.168.2.10"}, "192.168.2.11", false},
+		{"Reversed full range - true", []string{"192.168.2.10-192.168.1.250"}, "192.168.2.5", true},
+		{"Whitespace trimmed rule - true", []string{"  192.168.1.10-20  "}, "192.168.1.15", true},
 		{"Invalid rule - skip", []string{"invalid-rule"}, "192.168.1.1", false},
 		{"Malformed range - skip", []string{"192.168.1.1-abc"}, "192.168.1.1", false},
 	}
@@ -49,9 +51,11 @@ func TestHandleWebSocketParameters(t *testing.T) {
 		expectedStatus int
 	}{
 		{"Valid Zeek Port", "/ws?zeek_tcp=:4777", http.StatusOK},
+		{"Valid Zeek Port without colon", "/ws?zeek_tcp=4777", http.StatusOK},
 		{"Invalid Zeek Port (Low)", "/ws?zeek_tcp=:22", http.StatusBadRequest},
 		{"Invalid Zeek Port (Non-numeric)", "/ws?zeek_tcp=:abc", http.StatusBadRequest},
 		{"Invalid Zeek Port (Out of range)", "/ws?zeek_tcp=:70000", http.StatusBadRequest},
+		{"Path Traversal Pcap", "/ws?pcap=../../etc/passwd", http.StatusForbidden},
 	}
 
 	for _, tt := range tests {
