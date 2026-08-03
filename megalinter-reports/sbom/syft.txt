@@ -1,0 +1,50 @@
+[0000]  WARN no explicit name and version provided for directory source, deriving artifact ID from the given path (which is not ideal)
+NAME                            VERSION                             TYPE                            
+@pixi/colord                    2.9.6                               npm                             
+@pixi/react                     8.0.2                               npm                             
+@types/css-font-loading-module  0.0.12                              npm                             
+@types/earcut                   3.0.0                               npm                             
+@types/lodash                   4.17.17                             npm                             
+@types/prop-types               15.7.15                             npm                             
+@types/react                    18.3.23                             npm                             
+@types/react-reconciler         0.28.9                              npm                             
+@webgpu/types                   0.1.61                              npm                             
+@xmldom/xmldom                  0.8.10                              npm                             
+actions/checkout                v2                                  github-action  (+1 duplicate)   
+actions/checkout                v3                                  github-action                   
+actions/checkout                v4                                  github-action                   
+actions/setup-node              v1                                  github-action  (+2 duplicates)  
+actions/setup-node              v3                                  github-action                   
+actions/setup-node              v4                                  github-action                   
+csstype                         3.1.3                               npm                             
+earcut                          3.0.1                               npm                             
+eventemitter3                   5.0.1                               npm                             
+gifuct-js                       2.1.2                               npm                             
+github.com/c-robinson/iplib     v1.0.8                              go-module                       
+github.com/evanw/esbuild        v0.0.0-20221205015500-2953831c60ea  go-module      (+1 duplicate)   
+github.com/google/gopacket      v1.1.19                             go-module                       
+github.com/gorilla/websocket    v1.5.3                              go-module                       
+golang.org/x/sys                v0.0.0-20190412213103-97732733099d  go-module                       
+golang.org/x/sys                v0.0.0-20220715151400-c0bba94af5f8  go-module      (+1 duplicate)   
+ip-address                      10.0.1                              npm            (+1 duplicate)   
+ismobilejs                      1.1.1                               npm                             
+its-fine                        2.0.0                               npm                             
+js-binary-schema-parser         2.0.3                               npm                             
+lodash                          4.17.21                             npm                             
+parse-svg-path                  0.1.2                               npm                             
+pixi.js                         8.10.1                              npm                             
+prismjs                         1.30.0                              npm            (+1 duplicate)   
+react                           19.1.0                              npm                             
+react                           19.1.1                              npm                             
+react-dom                       19.1.0                              npm                             
+react-dom                       19.1.1                              npm                             
+react-icons                     5.5.0                               npm                             
+react-reconciler                0.31.0                              npm                             
+react-simple-code-editor        0.14.1                              npm            (+1 duplicate)   
+scheduler                       0.25.0                              npm                             
+scheduler                       0.26.0                              npm            (+1 duplicate)   
+stdlib                          go1.19.3                            go-module      (+1 duplicate)   
+use-sync-external-store         1.5.0                               npm                             
+vibes-network-visualizer        0.1.0                               npm                             
+ws                              8.18.2                              npm                             
+zustand                         4.5.7                               npm
